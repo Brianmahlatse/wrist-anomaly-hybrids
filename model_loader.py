@@ -1,223 +1,198 @@
-{
- "cells": [
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "028d0a6d",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "\"\"\"\n",
-    "model_loader.py\n",
-    "\n",
-    "Utility functions to:\n",
-    "1. Build the CNN and ViT backbones used in the paper\n",
-    "   (Xception, DenseNet201, DeiT-base-distilled, ViT-B/16).\n",
-    "2. Assemble Parallel or Sequential hybrid models.\n",
-    "3. Load trained checkpoints.\n",
-    "\n",
-    "This file is meant to let other researchers reproduce\n",
-    "the evaluation of our saved models on new wrist X-rays.\n",
-    "\n",
-    "We intentionally do not hardcode any private paths.\n",
-    "Callers must supply their own checkpoint locations.\n",
-    "\"\"\"\n",
-    "\n",
-    "import copy\n",
-    "import torch\n",
-    "\n",
-    "from hybrid_vision import (\n",
-    "    XceptionClassifier,\n",
-    "    DenseNet201Classifier,\n",
-    "    DeiTClassifier,\n",
-    "    ViTClassifier,\n",
-    "    CNNExtractor,\n",
-    "    ViTFeatureLayer,\n",
-    "    ParallelHybridClassifier,\n",
-    "    SequentialHybridClassifier,\n",
-    ")\n",
-    "\n",
-    "\n",
-    "def _device():\n",
-    "    return torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
-    "\n",
-    "\n",
-    "def build_backbones_pair(pair_name):\n",
-    "    \"\"\"\n",
-    "    Returns a tuple (cnn_model, vit_model) for a given backbone pair.\n",
-    "\n",
-    "    pair_name can be:\n",
-    "    - \"xc_deit\"  -> (XceptionClassifier, DeiTClassifier)\n",
-    "    - \"dn_vit\"   -> (DenseNet201Classifier, ViTClassifier)\n",
-    "\n",
-    "    The returned models are unmodified, just initialized with\n",
-    "    their ImageNet / pretrained transformer weights (via timm / HF).\n",
-    "    \"\"\"\n",
-    "    if pair_name == \"xc_deit\":\n",
-    "        cnn = XceptionClassifier()\n",
-    "        vit = DeiTClassifier()\n",
-    "    elif pair_name == \"dn_vit\":\n",
-    "        cnn = DenseNet201Classifier()\n",
-    "        vit = ViTClassifier()\n",
-    "    else:\n",
-    "        raise ValueError(\n",
-    "            f\"Unknown pair_name '{pair_name}'. \"\n",
-    "            \"Expected 'xc_deit' or 'dn_vit'.\"\n",
-    "        )\n",
-    "    return cnn, vit\n",
-    "\n",
-    "\n",
-    "def load_backbone_weights(cnn_model, vit_model, cnn_ckpt_path=None, vit_ckpt_path=None, map_location=\"cpu\"):\n",
-    "    \"\"\"\n",
-    "    Optionally load fine-tuned weights for the standalone CNN and ViT backbones\n",
-    "    before hybrid assembly.\n",
-    "\n",
-    "    cnn_ckpt_path and vit_ckpt_path are .pth or .pt state_dict files.\n",
-    "    Pass None to skip loading for that backbone.\n",
-    "    \"\"\"\n",
-    "    if cnn_ckpt_path is not None:\n",
-    "        state = torch.load(cnn_ckpt_path, map_location=map_location)\n",
-    "        cnn_model.load_state_dict(state)\n",
-    "\n",
-    "    if vit_ckpt_path is not None:\n",
-    "        state = torch.load(vit_ckpt_path, map_location=map_location)\n",
-    "        vit_model.load_state_dict(state)\n",
-    "\n",
-    "    return cnn_model, vit_model\n",
-    "\n",
-    "\n",
-    "def build_hybrid(\n",
-    "    fusion_type,\n",
-    "    cnn_model,\n",
-    "    vit_model,\n",
-    "    dropout_p=0.1,\n",
-    "    num_labels=1,\n",
-    "):\n",
-    "    \"\"\"\n",
-    "    Create either a Parallel or Sequential hybrid model using the\n",
-    "    provided CNN and ViT backbones.\n",
-    "\n",
-    "    fusion_type: \"parallel\" or \"sequential\"\n",
-    "    cnn_model:   an instance of XceptionClassifier or DenseNet201Classifier\n",
-    "    vit_model:   an instance of DeiTClassifier or ViTClassifier\n",
-    "    dropout_p:   dropout to apply in ViTFeatureLayer\n",
-    "    num_labels:  output dimension (1 for binary classification)\n",
-    "\n",
-    "    Returns:\n",
-    "        model (nn.Module) in eval() mode and moved to device\n",
-    "    \"\"\"\n",
-    "\n",
-    "    # Deep copy the base models so multiple hybrids don't share weights\n",
-    "    cnn_extractor = CNNExtractor(copy.deepcopy(cnn_model))\n",
-    "    vit_extractor = ViTFeatureLayer(copy.deepcopy(vit_model), dropout_p=dropout_p)\n",
-    "\n",
-    "    if fusion_type.lower() in [\"parallel\", \"par\"]:\n",
-    "        hybrid = ParallelHybridClassifier(\n",
-    "            cnn_extractor=cnn_extractor,\n",
-    "            vit_extractor=vit_extractor,\n",
-    "            num_labels=num_labels,\n",
-    "        )\n",
-    "    elif fusion_type.lower() in [\"sequential\", \"seq\"]:\n",
-    "        hybrid = SequentialHybridClassifier(\n",
-    "            cnn_extractor=cnn_extractor,\n",
-    "            vit_extractor=vit_extractor,\n",
-    "            num_labels=num_labels,\n",
-    "        )\n",
-    "    else:\n",
-    "        raise ValueError(\"fusion_type must be 'parallel'/'par' or 'sequential'/'seq'.\")\n",
-    "\n",
-    "    # Move to device and run a dummy forward pass to trigger lazy head creation\n",
-    "    dev = _device()\n",
-    "    hybrid = hybrid.to(dev).eval()\n",
-    "\n",
-    "    with torch.no_grad():\n",
-    "        dummy = torch.zeros(2, 3, 224, 224, device=dev)\n",
-    "        _ = hybrid(dummy)\n",
-    "\n",
-    "    return hybrid\n",
-    "\n",
-    "\n",
-    "def load_hybrid_from_checkpoint(\n",
-    "    fusion_type,\n",
-    "    pair_name,\n",
-    "    hybrid_ckpt_path,\n",
-    "    cnn_ckpt_path=None,\n",
-    "    vit_ckpt_path=None,\n",
-    "    map_location=\"cpu\",\n",
-    "    dropout_p=0.1,\n",
-    "    num_labels=1,\n",
-    "):\n",
-    "    \"\"\"\n",
-    "    High level convenience helper.\n",
-    "\n",
-    "    1. Build the requested backbone pair (xc_deit or dn_vit).\n",
-    "    2. (Optional) load standalone CNN/ViT weights if provided.\n",
-    "       For example, weights fine-tuned on wrist data.\n",
-    "    3. Build the requested hybrid (parallel or sequential).\n",
-    "    4. Load the trained hybrid checkpoint.\n",
-    "\n",
-    "    Args:\n",
-    "        fusion_type:   \"parallel\" / \"par\" or \"sequential\" / \"seq\"\n",
-    "        pair_name:     \"xc_deit\" or \"dn_vit\"\n",
-    "        hybrid_ckpt_path: path to the trained hybrid .pth state_dict\n",
-    "        cnn_ckpt_path: optional fine-tuned CNN weights\n",
-    "        vit_ckpt_path: optional fine-tuned ViT weights\n",
-    "        map_location:  default \"cpu\"\n",
-    "        dropout_p:     dropout for ViTFeatureLayer\n",
-    "        num_labels:    output classes (1 for binary)\n",
-    "\n",
-    "    Returns:\n",
-    "        model (nn.Module) ready for inference on the current device.\n",
-    "    \"\"\"\n",
-    "\n",
-    "    # 1. init backbones\n",
-    "    cnn_model, vit_model = build_backbones_pair(pair_name)\n",
-    "\n",
-    "    # 2. load fine-tuned standalone weights if available\n",
-    "    cnn_model, vit_model = load_backbone_weights(\n",
-    "        cnn_model,\n",
-    "        vit_model,\n",
-    "        cnn_ckpt_path=cnn_ckpt_path,\n",
-    "        vit_ckpt_path=vit_ckpt_path,\n",
-    "        map_location=map_location,\n",
-    "    )\n",
-    "\n",
-    "    # 3. assemble hybrid\n",
-    "    model = build_hybrid(\n",
-    "        fusion_type=fusion_type,\n",
-    "        cnn_model=cnn_model,\n",
-    "        vit_model=vit_model,\n",
-    "        dropout_p=dropout_p,\n",
-    "        num_labels=num_labels,\n",
-    "    )\n",
-    "\n",
-    "    # 4. load trained hybrid checkpoint\n",
-    "    state = torch.load(hybrid_ckpt_path, map_location=map_location)\n",
-    "    model.load_state_dict(state)\n",
-    "\n",
-    "    return model.eval()\n"
-   ]
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python 3 (ipykernel)",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.11.5"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 5
-}
+# -*- coding: utf-8 -*-
+"""model_loader.ipynb
+
+Automatically generated by Colab.
+
+Original file is located at
+    https://colab.research.google.com/drive/1x9eKbNqiXSFYO1WvdnF75los4ZvHFRMD
+"""
+
+"""
+model_loader.py
+
+Utility functions to:
+1. Build the CNN and ViT backbones used in the paper
+   (Xception, DenseNet201, DeiT-base-distilled, ViT-B/16).
+2. Assemble Parallel or Sequential hybrid models.
+3. Load trained checkpoints.
+
+This file is meant to let other researchers reproduce
+the evaluation of our saved models on new wrist X-rays.
+
+We intentionally do not hardcode any private paths.
+Callers must supply their own checkpoint locations.
+"""
+
+import copy
+import torch
+
+from hybrid_vision import (
+    XceptionClassifier,
+    DenseNet201Classifier,
+    DeiTClassifier,
+    ViTClassifier,
+    CNNExtractor,
+    ViTFeatureLayer,
+    ParallelHybridClassifier,
+    SequentialHybridClassifier,
+)
+
+
+def _device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def build_backbones_pair(pair_name):
+    """
+    Returns a tuple (cnn_model, vit_model) for a given backbone pair.
+
+    pair_name can be:
+    - "xc_deit"  -> (XceptionClassifier, DeiTClassifier)
+    - "dn_vit"   -> (DenseNet201Classifier, ViTClassifier)
+
+    The returned models are unmodified, just initialized with
+    their ImageNet / pretrained transformer weights (via timm / HF).
+    """
+    if pair_name == "xc_deit":
+        cnn = XceptionClassifier()
+        vit = DeiTClassifier()
+    elif pair_name == "dn_vit":
+        cnn = DenseNet201Classifier()
+        vit = ViTClassifier()
+    else:
+        raise ValueError(
+            f"Unknown pair_name '{pair_name}'. "
+            "Expected 'xc_deit' or 'dn_vit'."
+        )
+    return cnn, vit
+
+
+def load_backbone_weights(cnn_model, vit_model, cnn_ckpt_path=None, vit_ckpt_path=None, map_location="cpu"):
+    """
+    Optionally load fine-tuned weights for the standalone CNN and ViT backbones
+    before hybrid assembly.
+
+    cnn_ckpt_path and vit_ckpt_path are .pth or .pt state_dict files.
+    Pass None to skip loading for that backbone.
+    """
+    if cnn_ckpt_path is not None:
+        state = torch.load(cnn_ckpt_path, map_location=map_location)
+        cnn_model.load_state_dict(state)
+
+    if vit_ckpt_path is not None:
+        state = torch.load(vit_ckpt_path, map_location=map_location)
+        vit_model.load_state_dict(state)
+
+    return cnn_model, vit_model
+
+
+def build_hybrid(
+    fusion_type,
+    cnn_model,
+    vit_model,
+    dropout_p=0.1,
+    num_labels=1,
+):
+    """
+    Create either a Parallel or Sequential hybrid model using the
+    provided CNN and ViT backbones.
+
+    fusion_type: "parallel" or "sequential"
+    cnn_model:   an instance of XceptionClassifier or DenseNet201Classifier
+    vit_model:   an instance of DeiTClassifier or ViTClassifier
+    dropout_p:   dropout to apply in ViTFeatureLayer
+    num_labels:  output dimension (1 for binary classification)
+
+    Returns:
+        model (nn.Module) in eval() mode and moved to device
+    """
+
+    # Deep copy the base models so multiple hybrids don't share weights
+    cnn_extractor = CNNExtractor(copy.deepcopy(cnn_model))
+    vit_extractor = ViTFeatureLayer(copy.deepcopy(vit_model), dropout_p=dropout_p)
+
+    if fusion_type.lower() in ["parallel", "par"]:
+        hybrid = ParallelHybridClassifier(
+            cnn_extractor=cnn_extractor,
+            vit_extractor=vit_extractor,
+            num_labels=num_labels,
+        )
+    elif fusion_type.lower() in ["sequential", "seq"]:
+        hybrid = SequentialHybridClassifier(
+            cnn_extractor=cnn_extractor,
+            vit_extractor=vit_extractor,
+            num_labels=num_labels,
+        )
+    else:
+        raise ValueError("fusion_type must be 'parallel'/'par' or 'sequential'/'seq'.")
+
+    # Move to device and run a dummy forward pass to trigger lazy head creation
+    dev = _device()
+    hybrid = hybrid.to(dev).eval()
+
+    with torch.no_grad():
+        dummy = torch.zeros(2, 3, 224, 224, device=dev)
+        _ = hybrid(dummy)
+
+    return hybrid
+
+
+def load_hybrid_from_checkpoint(
+    fusion_type,
+    pair_name,
+    hybrid_ckpt_path,
+    cnn_ckpt_path=None,
+    vit_ckpt_path=None,
+    map_location="cpu",
+    dropout_p=0.1,
+    num_labels=1,
+):
+    """
+    High level convenience helper.
+
+    1. Build the requested backbone pair (xc_deit or dn_vit).
+    2. (Optional) load standalone CNN/ViT weights if provided.
+       For example, weights fine-tuned on wrist data.
+    3. Build the requested hybrid (parallel or sequential).
+    4. Load the trained hybrid checkpoint.
+
+    Args:
+        fusion_type:   "parallel" / "par" or "sequential" / "seq"
+        pair_name:     "xc_deit" or "dn_vit"
+        hybrid_ckpt_path: path to the trained hybrid .pth state_dict
+        cnn_ckpt_path: optional fine-tuned CNN weights
+        vit_ckpt_path: optional fine-tuned ViT weights
+        map_location:  default "cpu"
+        dropout_p:     dropout for ViTFeatureLayer
+        num_labels:    output classes (1 for binary)
+
+    Returns:
+        model (nn.Module) ready for inference on the current device.
+    """
+
+    # 1. init backbones
+    cnn_model, vit_model = build_backbones_pair(pair_name)
+
+    # 2. load fine-tuned standalone weights if available
+    cnn_model, vit_model = load_backbone_weights(
+        cnn_model,
+        vit_model,
+        cnn_ckpt_path=cnn_ckpt_path,
+        vit_ckpt_path=vit_ckpt_path,
+        map_location=map_location,
+    )
+
+    # 3. assemble hybrid
+    model = build_hybrid(
+        fusion_type=fusion_type,
+        cnn_model=cnn_model,
+        vit_model=vit_model,
+        dropout_p=dropout_p,
+        num_labels=num_labels,
+    )
+
+    # 4. load trained hybrid checkpoint
+    state = torch.load(hybrid_ckpt_path, map_location=map_location)
+    model.load_state_dict(state)
+
+    return model.eval()

@@ -1,210 +1,185 @@
-{
- "cells": [
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "5f64283a",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "\"\"\"\n",
-    "data_utils.py\n",
-    "\n",
-    "Data loading, augmentation, batching and evaluation metrics\n",
-    "for wrist anomaly classification.\n",
-    "\n",
-    "Contents:\n",
-    "  - SingleImageDataset\n",
-    "  - train_transforms / val_transforms\n",
-    "  - collate_fn \n",
-    "  - compute_metrics\n",
-    "\n",
-    "All model definitions (CNN backbones, ViT backbones, hybrid\n",
-    "fusion models, partial-freezing utilities) live in\n",
-    "hybrid_vision.py and should NOT be duplicated here.\n",
-    "\"\"\"\n",
-    "\n",
-    "from typing import Optional, Tuple\n",
-    "import numpy as np\n",
-    "import torch\n",
-    "from torch.utils.data import Dataset\n",
-    "from torchvision import transforms\n",
-    "from PIL import Image\n",
-    "from sklearn.metrics import accuracy_score, recall_score, roc_auc_score\n",
-    "\n",
-    "\n",
-    "class SingleImageDataset(Dataset):\n",
-    "    \"\"\"\n",
-    "    Minimal dataset wrapper for binary classification on wrist X-rays.\n",
-    "\n",
-    "    Accepts image arrays with shapes:\n",
-    "      [H, W] grayscale\n",
-    "      [H, W, 1] or [H, W, 3]\n",
-    "      [C, H, W] where C is 1 or 3\n",
-    "      [N, ...] if you're passing a batch externally\n",
-    "\n",
-    "    labels should be 0/1 or float-castable.\n",
-    "\n",
-    "    transform should map a PIL.Image -> torch.FloatTensor [3, 224, 224].\n",
-    "    \"\"\"\n",
-    "\n",
-    "    def __init__(self, images, labels, transform: Optional[transforms.Compose] = None):\n",
-    "        self.images = images\n",
-    "        self.labels = labels\n",
-    "        self.transform = transform\n",
-    "\n",
-    "    def __len__(self) -> int:\n",
-    "        return len(self.images)\n",
-    "\n",
-    "    def _to_pil(self, arr) -> Image.Image:\n",
-    "        \"\"\"\n",
-    "        Convert an array or tensor to a 3-channel uint8 PIL image.\n",
-    "        \"\"\"\n",
-    "        if isinstance(arr, torch.Tensor):\n",
-    "            arr = arr.detach().cpu().numpy()\n",
-    "\n",
-    "        # Make channels last, RGB\n",
-    "        if arr.ndim == 2:\n",
-    "            # [H, W] -> [H, W, 3]\n",
-    "            arr = np.stack([arr, arr, arr], axis=-1)\n",
-    "        elif arr.ndim == 3 and arr.shape[0] in (1, 3):\n",
-    "            # [C, H, W] -> [H, W, C]\n",
-    "            arr = np.transpose(arr, (1, 2, 0))\n",
-    "        elif arr.ndim == 3 and arr.shape[-1] == 1:\n",
-    "            # [H, W, 1] -> [H, W, 3]\n",
-    "            arr = np.repeat(arr, 3, axis=-1)\n",
-    "        elif arr.ndim != 3:\n",
-    "            raise ValueError(f\"Unexpected image shape: {arr.shape}\")\n",
-    "\n",
-    "        # Ensure uint8 for PIL\n",
-    "        if np.issubdtype(arr.dtype, np.floating):\n",
-    "            if arr.max() <= 1.0:\n",
-    "                arr = (arr * 255.0).astype(np.uint8)\n",
-    "            else:\n",
-    "                arr = arr.astype(np.uint8)\n",
-    "        elif arr.dtype != np.uint8:\n",
-    "            arr = arr.astype(np.uint8)\n",
-    "\n",
-    "        return Image.fromarray(arr)\n",
-    "\n",
-    "    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:\n",
-    "        img = self.images[idx]\n",
-    "        label = self.labels[idx]\n",
-    "\n",
-    "        img = self._to_pil(img)\n",
-    "        if self.transform:\n",
-    "            img = self.transform(img)\n",
-    "\n",
-    "        # binary classification target\n",
-    "        label = torch.tensor([float(label)], dtype=torch.float32)\n",
-    "\n",
-    "        return img, label\n",
-    "\n",
-    "\n",
-    "# -------------------------------------------------\n",
-    "# Data augmentation / preprocessing\n",
-    "# -------------------------------------------------\n",
-    "\n",
-    "train_transforms = transforms.Compose([\n",
-    "    transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),\n",
-    "    transforms.RandomHorizontalFlip(),\n",
-    "    transforms.RandomRotation(10),\n",
-    "    transforms.ColorJitter(\n",
-    "        brightness=0.2,\n",
-    "        contrast=0.2,\n",
-    "        saturation=0.2,\n",
-    "        hue=0.1\n",
-    "    ),\n",
-    "    transforms.ToTensor(),\n",
-    " \n",
-    "])\n",
-    "\n",
-    "val_transforms = transforms.Compose([\n",
-    "    transforms.Resize((224, 224)),\n",
-    "    transforms.ToTensor(),\n",
-    "   \n",
-    "])\n",
-    "\n",
-    "\n",
-    "# -------------------------------------------------\n",
-    "# Collate helpers for DataLoader\n",
-    "# -------------------------------------------------\n",
-    "\n",
-    "def collate_fn(batch):\n",
-    "    \"\"\"\n",
-    "    Collate [(img_tensor, label_tensor), ...] into a dict\n",
-    "    that matches what the hybrid models expect.\n",
-    "    \"\"\"\n",
-    "    imgs, labels = zip(*batch)\n",
-    "    imgs = torch.stack(imgs)         # [B, 3, 224, 224]\n",
-    "    labels = torch.stack(labels)     # [B, 1]\n",
-    "    return {\"pixel_values\": imgs, \"labels\": labels}\n",
-    "\n",
-    "\n",
-    "# -------------------------------------------------\n",
-    "# Metrics for evaluation / validation\n",
-    "# -------------------------------------------------\n",
-    "\n",
-    "def compute_metrics(eval_pred):\n",
-    "    \"\"\"\n",
-    "    Compute standard metrics:\n",
-    "    - accuracy\n",
-    "    - recall (sensitivity on the positive class)\n",
-    "    - ROC AUC\n",
-    "\n",
-    "    eval_pred can be:\n",
-    "      (logits, labels)\n",
-    "      or an object with .predictions and .label_ids\n",
-    "      (for example, HuggingFace Trainer EvalPrediction)\n",
-    "    \"\"\"\n",
-    "    if isinstance(eval_pred, tuple):\n",
-    "        logits, labels = eval_pred\n",
-    "    else:\n",
-    "        logits = eval_pred.predictions\n",
-    "        labels = eval_pred.label_ids\n",
-    "\n",
-    "    logits = np.asarray(logits).squeeze()         # [N] or [N,1] -> [N]\n",
-    "    labels = np.asarray(labels).reshape(-1)       # [N]\n",
-    "\n",
-    "    probs = 1.0 / (1.0 + np.exp(-logits))         # sigmoid\n",
-    "    preds = (probs >= 0.5).astype(int)\n",
-    "\n",
-    "    acc = accuracy_score(labels, preds)\n",
-    "    rec = recall_score(labels, preds)             # positive class recall\n",
-    "\n",
-    "    try:\n",
-    "        auc = roc_auc_score(labels, probs)        # uses probabilities\n",
-    "    except ValueError:\n",
-    "        # AUC fails if only one class is present\n",
-    "        auc = float(\"nan\")\n",
-    "\n",
-    "    return {\n",
-    "        \"accuracy\": acc,\n",
-    "        \"recall\": rec,\n",
-    "        \"auc\": auc,\n",
-    "    }\n"
-   ]
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python 3 (ipykernel)",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.11.5"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 5
-}
+# -*- coding: utf-8 -*-
+"""data_utils.ipynb
+
+Automatically generated by Colab.
+
+Original file is located at
+    https://colab.research.google.com/drive/1k704Cb5TdEqd6jVM5rJFjJwB5oKLbhcH
+"""
+
+"""
+data_utils.py
+
+Data loading, augmentation, batching and evaluation metrics
+for wrist anomaly classification.
+
+Contents:
+  - SingleImageDataset
+  - train_transforms / val_transforms
+  - collate_fn
+  - compute_metrics
+
+All model definitions (CNN backbones, ViT backbones, hybrid
+fusion models, partial-freezing utilities) live in
+hybrid_vision.py and should NOT be duplicated here.
+"""
+
+from typing import Optional, Tuple
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from torchvision import transforms
+from PIL import Image
+from sklearn.metrics import accuracy_score, recall_score, roc_auc_score
+
+
+class SingleImageDataset(Dataset):
+    """
+    Minimal dataset wrapper for binary classification on wrist X-rays.
+
+    Accepts image arrays with shapes:
+      [H, W] grayscale
+      [H, W, 1] or [H, W, 3]
+      [C, H, W] where C is 1 or 3
+      [N, ...] if you're passing a batch externally
+
+    labels should be 0/1 or float-castable.
+
+    transform should map a PIL.Image -> torch.FloatTensor [3, 224, 224].
+    """
+
+    def __init__(self, images, labels, transform: Optional[transforms.Compose] = None):
+        self.images = images
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def _to_pil(self, arr) -> Image.Image:
+        """
+        Convert an array or tensor to a 3-channel uint8 PIL image.
+        """
+        if isinstance(arr, torch.Tensor):
+            arr = arr.detach().cpu().numpy()
+
+        # Make channels last, RGB
+        if arr.ndim == 2:
+            # [H, W] -> [H, W, 3]
+            arr = np.stack([arr, arr, arr], axis=-1)
+        elif arr.ndim == 3 and arr.shape[0] in (1, 3):
+            # [C, H, W] -> [H, W, C]
+            arr = np.transpose(arr, (1, 2, 0))
+        elif arr.ndim == 3 and arr.shape[-1] == 1:
+            # [H, W, 1] -> [H, W, 3]
+            arr = np.repeat(arr, 3, axis=-1)
+        elif arr.ndim != 3:
+            raise ValueError(f"Unexpected image shape: {arr.shape}")
+
+        # Ensure uint8 for PIL
+        if np.issubdtype(arr.dtype, np.floating):
+            if arr.max() <= 1.0:
+                arr = (arr * 255.0).astype(np.uint8)
+            else:
+                arr = arr.astype(np.uint8)
+        elif arr.dtype != np.uint8:
+            arr = arr.astype(np.uint8)
+
+        return Image.fromarray(arr)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        img = self.images[idx]
+        label = self.labels[idx]
+
+        img = self._to_pil(img)
+        if self.transform:
+            img = self.transform(img)
+
+        # binary classification target
+        label = torch.tensor([float(label)], dtype=torch.float32)
+
+        return img, label
+
+
+# -------------------------------------------------
+# Data augmentation / preprocessing
+# -------------------------------------------------
+
+train_transforms = transforms.Compose([
+    transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
+    transforms.ColorJitter(
+        brightness=0.2,
+        contrast=0.2,
+        saturation=0.2,
+        hue=0.1
+    ),
+    transforms.ToTensor(),
+
+])
+
+val_transforms = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+
+])
+
+
+# -------------------------------------------------
+# Collate helpers for DataLoader
+# -------------------------------------------------
+
+def collate_fn(batch):
+    """
+    Collate [(img_tensor, label_tensor), ...] into a dict
+    that matches what the hybrid models expect.
+    """
+    imgs, labels = zip(*batch)
+    imgs = torch.stack(imgs)         # [B, 3, 224, 224]
+    labels = torch.stack(labels)     # [B, 1]
+    return {"pixel_values": imgs, "labels": labels}
+
+
+# -------------------------------------------------
+# Metrics for evaluation / validation
+# -------------------------------------------------
+
+def compute_metrics(eval_pred):
+    """
+    Compute standard metrics:
+    - accuracy
+    - recall (sensitivity on the positive class)
+    - ROC AUC
+
+    eval_pred can be:
+      (logits, labels)
+      or an object with .predictions and .label_ids
+      (for example, HuggingFace Trainer EvalPrediction)
+    """
+    if isinstance(eval_pred, tuple):
+        logits, labels = eval_pred
+    else:
+        logits = eval_pred.predictions
+        labels = eval_pred.label_ids
+
+    logits = np.asarray(logits).squeeze()         # [N] or [N,1] -> [N]
+    labels = np.asarray(labels).reshape(-1)       # [N]
+
+    probs = 1.0 / (1.0 + np.exp(-logits))         # sigmoid
+    preds = (probs >= 0.5).astype(int)
+
+    acc = accuracy_score(labels, preds)
+    rec = recall_score(labels, preds)             # positive class recall
+
+    try:
+        auc = roc_auc_score(labels, probs)        # uses probabilities
+    except ValueError:
+        # AUC fails if only one class is present
+        auc = float("nan")
+
+    return {
+        "accuracy": acc,
+        "recall": rec,
+        "auc": auc,
+    }

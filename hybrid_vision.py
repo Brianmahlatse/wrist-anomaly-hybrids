@@ -1,563 +1,538 @@
-{
- "cells": [
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "3ca1ca2f",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "\"\"\"\n",
-    "hybrid_vision.py\n",
-    "\n",
-    "Core model components used in the paper:\n",
-    "1. CNN classifiers (Xception, DenseNet201)\n",
-    "2. ViT / DeiT classifiers\n",
-    "3. Feature extractors for CNN and ViT backbones\n",
-    "4. Parallel and Sequential CNN–ViT hybrid architectures\n",
-    "\n",
-    "These classes are sufficient to:\n",
-    "- Recreate the hybrid models used in the study\n",
-    "- Load pretrained checkpoints\n",
-    "- Run inference and evaluation\n",
-    "\n",
-    "Author: [Your name]\n",
-    "\"\"\"\n",
-    "\n",
-    "import torch\n",
-    "import torch.nn as nn\n",
-    "import torch.nn.functional as F\n",
-    "import timm\n",
-    "from transformers import DeiTModel, ViTModel\n",
-    "\n",
-    "\n",
-    "# -------------------------\n",
-    "# Backbone classifiers\n",
-    "# -------------------------\n",
-    "\n",
-    "class XceptionClassifier(nn.Module):\n",
-    "    \"\"\"\n",
-    "    CNN baseline using an ImageNet pretrained Xception-style backbone (timm 'legacy_xception').\n",
-    "    Outputs a single logit for binary classification.\n",
-    "    \"\"\"\n",
-    "    def __init__(self, dropout: float = 0.3):\n",
-    "        super().__init__()\n",
-    "        self.backbone = timm.create_model(\n",
-    "            \"legacy_xception\",\n",
-    "            pretrained=True,\n",
-    "            num_classes=0,          # no classifier head\n",
-    "            global_pool=\"avg\"\n",
-    "        )\n",
-    "        in_feats = self.backbone.num_features\n",
-    "        self.classifier = nn.Sequential(\n",
-    "            nn.Linear(in_feats, 1024),\n",
-    "            nn.ReLU(inplace=True),\n",
-    "            nn.Dropout(dropout),\n",
-    "            nn.Linear(1024, 1)\n",
-    "        )\n",
-    "        self.loss_fn = nn.BCEWithLogitsLoss()\n",
-    "\n",
-    "    def forward(self, pixel_values: torch.Tensor, labels: torch.Tensor = None):\n",
-    "        feats = self.backbone(pixel_values)          # [B, F]\n",
-    "        logits = self.classifier(feats)              # [B, 1]\n",
-    "\n",
-    "        out = {\"logits\": logits}\n",
-    "        if labels is not None:\n",
-    "            labels = labels.float().view(-1, 1)\n",
-    "            out[\"loss\"] = self.loss_fn(logits, labels)\n",
-    "        return out\n",
-    "\n",
-    "\n",
-    "class DenseNet201Classifier(nn.Module):\n",
-    "    \"\"\"\n",
-    "    CNN baseline using an ImageNet pretrained DenseNet-201 backbone.\n",
-    "    Same head shape as XceptionClassifier for consistency.\n",
-    "    \"\"\"\n",
-    "    def __init__(self, dropout: float = 0.3):\n",
-    "        super().__init__()\n",
-    "        self.backbone = timm.create_model(\n",
-    "            \"densenet201.tv_in1k\",\n",
-    "            pretrained=True,\n",
-    "            num_classes=0,\n",
-    "            global_pool=\"avg\"\n",
-    "        )\n",
-    "        in_feats = self.backbone.num_features\n",
-    "        self.classifier = nn.Sequential(\n",
-    "            nn.Linear(in_feats, 1024),\n",
-    "            nn.ReLU(inplace=True),\n",
-    "            nn.Dropout(dropout),\n",
-    "            nn.Linear(1024, 1)\n",
-    "        )\n",
-    "        self.loss_fn = nn.BCEWithLogitsLoss()\n",
-    "\n",
-    "    def forward(self, pixel_values: torch.Tensor, labels: torch.Tensor = None):\n",
-    "        feats = self.backbone(pixel_values)          # [B, F]\n",
-    "        logits = self.classifier(feats)              # [B, 1]\n",
-    "\n",
-    "        out = {\"logits\": logits}\n",
-    "        if labels is not None:\n",
-    "            labels = labels.float().view(-1, 1)\n",
-    "            out[\"loss\"] = self.loss_fn(logits, labels)\n",
-    "        return out\n",
-    "\n",
-    "\n",
-    "class DeiTClassifier(nn.Module):\n",
-    "    \"\"\"\n",
-    "    Transformer baseline using a DeiT backbone (distilled DeiT-base).\n",
-    "    Returns a single logit for binary classification.\n",
-    "    \"\"\"\n",
-    "    def __init__(self, model_name: str = \"facebook/deit-base-distilled-patch16-224\", dropout: float = 0.3):\n",
-    "        super().__init__()\n",
-    "        self.vit = DeiTModel.from_pretrained(model_name, ignore_mismatched_sizes=True)\n",
-    "        self.head = nn.Sequential(\n",
-    "            nn.Linear(768, 512),\n",
-    "            nn.ReLU(inplace=True),\n",
-    "            nn.Dropout(dropout),\n",
-    "            nn.Linear(512, 1)\n",
-    "        )\n",
-    "        self.loss_fn = nn.BCEWithLogitsLoss()\n",
-    "\n",
-    "    def forward(self, pixel_values: torch.Tensor, labels: torch.Tensor = None):\n",
-    "        cls_token = self.vit(pixel_values=pixel_values).last_hidden_state[:, 0, :]  # [B, 768]\n",
-    "        logits = self.head(cls_token)                                               # [B, 1]\n",
-    "\n",
-    "        out = {\"logits\": logits}\n",
-    "        if labels is not None:\n",
-    "            out[\"loss\"] = self.loss_fn(logits, labels)\n",
-    "        return out\n",
-    "\n",
-    "\n",
-    "class ViTClassifier(nn.Module):\n",
-    "    \"\"\"\n",
-    "    Transformer baseline using a ViT backbone (e.g. ViT-B/16).\n",
-    "    Mirrors DeiTClassifier but swaps the pretrained backbone.\n",
-    "    \"\"\"\n",
-    "    def __init__(self, model_name: str = \"google/vit-base-patch16-224\", dropout: float = 0.3):\n",
-    "        super().__init__()\n",
-    "        self.vit = ViTModel.from_pretrained(model_name, ignore_mismatched_sizes=True)\n",
-    "        self.head = nn.Sequential(\n",
-    "            nn.Linear(768, 512),\n",
-    "            nn.ReLU(inplace=True),\n",
-    "            nn.Dropout(dropout),\n",
-    "            nn.Linear(512, 1)\n",
-    "        )\n",
-    "        self.loss_fn = nn.BCEWithLogitsLoss()\n",
-    "\n",
-    "    def forward(self, pixel_values: torch.Tensor, labels: torch.Tensor = None):\n",
-    "        cls_token = self.vit(pixel_values=pixel_values).last_hidden_state[:, 0, :]  # [B, 768]\n",
-    "        logits = self.head(cls_token)                                               # [B, 1]\n",
-    "\n",
-    "        out = {\"logits\": logits}\n",
-    "        if labels is not None:\n",
-    "            out[\"loss\"] = self.loss_fn(logits, labels)\n",
-    "        return out\n",
-    "\n",
-    "\n",
-    "# -------------------------------------------------\n",
-    "# Freezing strategy for partial fine-tuning\n",
-    "# -------------------------------------------------\n",
-    "\n",
-    "def set_trainable_fraction(\n",
-    "    model: nn.Module,\n",
-    "    kind: str = \"vit\",\n",
-    "    fraction: float = 0.6,\n",
-    "    freeze_embeddings: bool = True,\n",
-    "    keep_stem_frozen: bool = True,\n",
-    "):\n",
-    "    \"\"\"\n",
-    "    Partially unfreezes only the last `fraction` of the backbone blocks.\n",
-    "\n",
-    "    kind=\"vit\": works with HuggingFace DeiT / ViT or timm ViT.\n",
-    "    kind=\"cnn\": works with timm CNN backbones.\n",
-    "\n",
-    "    After this call:\n",
-    "    - most of the backbone is frozen\n",
-    "    - classifier / head layers are still trainable\n",
-    "    \"\"\"\n",
-    "    # unwrap DataParallel if present\n",
-    "    if hasattr(model, \"module\"):\n",
-    "        model = model.module\n",
-    "\n",
-    "    # freeze everything first\n",
-    "    for p in model.parameters():\n",
-    "        p.requires_grad = False\n",
-    "\n",
-    "    if kind == \"vit\":\n",
-    "        vit = getattr(model, \"vit\", None)\n",
-    "        blocks = None\n",
-    "\n",
-    "        if vit is not None:\n",
-    "            # HuggingFace structure\n",
-    "            if hasattr(vit, \"encoder\") and hasattr(vit.encoder, \"layer\"):\n",
-    "                blocks = list(vit.encoder.layer)\n",
-    "            # timm-style ViT\n",
-    "            elif hasattr(vit, \"blocks\"):\n",
-    "                blocks = list(vit.blocks)\n",
-    "\n",
-    "        if blocks is None:\n",
-    "            raise ValueError(\"ViT blocks not found\")\n",
-    "\n",
-    "        n = len(blocks)\n",
-    "        k = max(1, int(round(fraction * n)))\n",
-    "        cutoff = n - k\n",
-    "\n",
-    "        for i, blk in enumerate(blocks):\n",
-    "            if i >= cutoff:\n",
-    "                for p in blk.parameters():\n",
-    "                    p.requires_grad = True\n",
-    "\n",
-    "        # final norms / pooler\n",
-    "        for mod in [getattr(vit, \"layernorm\", None), getattr(vit, \"pooler\", None)]:\n",
-    "            if mod is not None:\n",
-    "                for p in mod.parameters():\n",
-    "                    p.requires_grad = True\n",
-    "\n",
-    "        # optionally unfreeze embeddings\n",
-    "        if not freeze_embeddings and hasattr(vit, \"embeddings\"):\n",
-    "            for p in vit.embeddings.parameters():\n",
-    "                p.requires_grad = True\n",
-    "\n",
-    "    elif kind == \"cnn\":\n",
-    "        bb = getattr(model, \"backbone\", model)\n",
-    "        if hasattr(bb, \"blocks\"):\n",
-    "            blocks = list(bb.blocks)\n",
-    "        elif hasattr(bb, \"features\"):\n",
-    "            blocks = list(bb.features)\n",
-    "        else:\n",
-    "            blocks = [m for m in bb.children()]\n",
-    "\n",
-    "        n = len(blocks)\n",
-    "        k = max(1, int(round(fraction * n)))\n",
-    "        cutoff = n - k\n",
-    "\n",
-    "        for i, blk in enumerate(blocks):\n",
-    "            if i >= cutoff:\n",
-    "                for p in blk.parameters():\n",
-    "                    p.requires_grad = True\n",
-    "\n",
-    "        if not keep_stem_frozen and hasattr(bb, \"stem\"):\n",
-    "            for p in bb.stem.parameters():\n",
-    "                p.requires_grad = True\n",
-    "\n",
-    "    else:\n",
-    "        raise ValueError(\"kind must be 'vit' or 'cnn'\")\n",
-    "\n",
-    "    # always keep classifier / head trainable\n",
-    "    for name in [\"classifier\", \"head\"]:\n",
-    "        if hasattr(model, name):\n",
-    "            for p in getattr(model, name).parameters():\n",
-    "                p.requires_grad = True\n",
-    "\n",
-    "\n",
-    "# -------------------------------------------------\n",
-    "# Feature extraction blocks used by the hybrids\n",
-    "# -------------------------------------------------\n",
-    "\n",
-    "class CNNExtractor(nn.Module):\n",
-    "    \"\"\"\n",
-    "    Wraps a CNN classifier or backbone and returns a pooled feature vector [B, C].\n",
-    "    Removes the final classification head and exposes features only.\n",
-    "    \"\"\"\n",
-    "    def __init__(self, model: nn.Module):\n",
-    "        super().__init__()\n",
-    "        # Some classifiers store the CNN in .backbone, others are the backbone directly\n",
-    "        self.backbone = getattr(model, \"backbone\", model)\n",
-    "\n",
-    "    def forward(self, x: torch.Tensor) -> torch.Tensor:\n",
-    "        # timm CNNs often expose forward_features()\n",
-    "        if hasattr(self.backbone, \"forward_features\"):\n",
-    "            out = self.backbone.forward_features(x)\n",
-    "\n",
-    "            # timm DenseNet / EfficientNet style outputs\n",
-    "            if isinstance(out, dict) and \"global_pool\" in out:\n",
-    "                return out[\"global_pool\"]  # [B, C]\n",
-    "\n",
-    "            # if we still have [B, C, H, W], apply global pooling\n",
-    "            if isinstance(out, torch.Tensor) and out.ndim == 4:\n",
-    "                out = F.adaptive_avg_pool2d(out, 1).flatten(1)\n",
-    "            return out  # [B, C]\n",
-    "\n",
-    "        # fallback: just call the module, assume it returns embeddings\n",
-    "        return self.backbone(x)\n",
-    "\n",
-    "\n",
-    "class ViTFeatureLayer(nn.Module):\n",
-    "    \"\"\"\n",
-    "    Wraps a DeiT/ViT model and returns the CLS token embedding [B, D],\n",
-    "    with optional dropout for regularization.\n",
-    "    \"\"\"\n",
-    "    def __init__(self, vit_model: nn.Module, dropout_p: float = 0.1):\n",
-    "        super().__init__()\n",
-    "        # Some wrappers store the transformer in .vit already\n",
-    "        self.vit = getattr(vit_model, \"vit\", vit_model)\n",
-    "        self.drop = nn.Dropout(dropout_p)\n",
-    "\n",
-    "    def forward(self, x: torch.Tensor) -> torch.Tensor:\n",
-    "        # HuggingFace ViT / DeiT interface\n",
-    "        if hasattr(self.vit, \"config\"):\n",
-    "            out = self.vit(x, return_dict=True)\n",
-    "            cls_token = out.last_hidden_state[:, 0]        # [B, D]\n",
-    "            return self.drop(cls_token)\n",
-    "\n",
-    "        # timm ViT interface\n",
-    "        if hasattr(self.vit, \"forward_features\"):\n",
-    "            feats = self.vit.forward_features(x)\n",
-    "\n",
-    "            # timm sometimes returns dicts\n",
-    "            if isinstance(feats, dict):\n",
-    "                token = feats.get(\"x\", None)\n",
-    "                if token is None:\n",
-    "                    # fallback: first 2D tensor in dict\n",
-    "                    for v in feats.values():\n",
-    "                        if isinstance(v, torch.Tensor) and v.ndim == 2:\n",
-    "                            token = v\n",
-    "                            break\n",
-    "                cls_token = token\n",
-    "            else:\n",
-    "                # tensor\n",
-    "                if feats.ndim == 3:\n",
-    "                    cls_token = feats[:, 0]                # [B, D]\n",
-    "                else:\n",
-    "                    cls_token = feats                      # already [B, D]\n",
-    "\n",
-    "            return self.drop(cls_token)\n",
-    "\n",
-    "        raise ValueError(\"Unsupported ViT model type for feature extraction\")\n",
-    "\n",
-    "\n",
-    "# -------------------------------------------------\n",
-    "# Attention fusion blocks used inside hybrids\n",
-    "# -------------------------------------------------\n",
-    "\n",
-    "class SqueezeExcitation(nn.Module):\n",
-    "    \"\"\"\n",
-    "    Lightweight channel attention used to reweight fused CNN/ViT features.\n",
-    "    \"\"\"\n",
-    "    def __init__(self, channels: int, ratio: int = 8):\n",
-    "        super().__init__()\n",
-    "        hidden = max(1, channels // ratio)\n",
-    "        self.avg = nn.AdaptiveAvgPool2d(1)\n",
-    "        self.fc1 = nn.Linear(channels, hidden, bias=False)\n",
-    "        self.fc2 = nn.Linear(hidden, channels, bias=False)\n",
-    "\n",
-    "    def forward(self, x: torch.Tensor) -> torch.Tensor:\n",
-    "        # x: [B, C, H, W]\n",
-    "        b, c, _, _ = x.shape\n",
-    "        y = self.avg(x).view(b, c)               # [B, C]\n",
-    "        y = F.relu(self.fc1(y), inplace=True)\n",
-    "        y = torch.sigmoid(self.fc2(y)).view(b, c, 1, 1)\n",
-    "        return x * y\n",
-    "\n",
-    "\n",
-    "# -------------------------------------------------\n",
-    "# Parallel fusion hybrid\n",
-    "# -------------------------------------------------\n",
-    "\n",
-    "class ParallelHybridClassifier(nn.Module):\n",
-    "    \"\"\"\n",
-    "    Parallel fusion hybrid:\n",
-    "    - Extract CNN features and ViT features independently\n",
-    "    - Concatenate\n",
-    "    - Apply SE attention and MLP head\n",
-    "    \"\"\"\n",
-    "    def __init__(\n",
-    "        self,\n",
-    "        cnn_extractor: nn.Module,\n",
-    "        vit_extractor: nn.Module,\n",
-    "        num_labels: int = 1,\n",
-    "        se_ratio: int = 8,\n",
-    "        dropout1: float = 0.4,\n",
-    "        dropout2: float = 0.15,\n",
-    "        loss_fn: nn.Module = None,\n",
-    "        use_logits: bool = True,\n",
-    "        feat_dim: int = None,\n",
-    "    ):\n",
-    "        super().__init__()\n",
-    "        self.cnn_feat = cnn_extractor\n",
-    "        self.vit_feat = vit_extractor\n",
-    "        self.use_logits = use_logits\n",
-    "        self.loss_fn = loss_fn or nn.BCEWithLogitsLoss()\n",
-    "\n",
-    "        # store head config for lazy construction\n",
-    "        self._head_cfg = dict(\n",
-    "            num_labels=num_labels,\n",
-    "            se_ratio=se_ratio,\n",
-    "            d1=dropout1,\n",
-    "            d2=dropout2,\n",
-    "        )\n",
-    "        self._head_built = feat_dim is not None\n",
-    "        if self._head_built:\n",
-    "            self._build_head(feat_dim, **self._head_cfg)\n",
-    "\n",
-    "    def _build_head(self, feat_dim: int, num_labels: int, se_ratio: int, d1: float, d2: float):\n",
-    "        self.se = SqueezeExcitation(feat_dim, ratio=se_ratio)\n",
-    "        self.head = nn.Sequential(\n",
-    "            nn.Linear(feat_dim, 512),\n",
-    "            nn.ReLU(inplace=True),\n",
-    "            nn.BatchNorm1d(512),\n",
-    "            nn.Dropout(d1),\n",
-    "            nn.Linear(512, 256),\n",
-    "            nn.ReLU(inplace=True),\n",
-    "            nn.BatchNorm1d(256),\n",
-    "            nn.Dropout(d2),\n",
-    "            nn.Linear(256, num_labels),\n",
-    "        )\n",
-    "        self._head_built = True\n",
-    "\n",
-    "    def forward(self, pixel_values: torch.Tensor, labels: torch.Tensor = None):\n",
-    "        f_cnn = self.cnn_feat(pixel_values)      # [B, Cc]\n",
-    "        f_vit = self.vit_feat(pixel_values)      # [B, Cv]\n",
-    "        fused = torch.cat([f_cnn, f_vit], dim=1) # [B, Cc+Cv]\n",
-    "\n",
-    "        if not self._head_built:\n",
-    "            self._build_head(fused.size(1), **self._head_cfg)\n",
-    "            # move dynamically created layers to correct device\n",
-    "            dev = fused.device\n",
-    "            self.se = self.se.to(dev)\n",
-    "            self.head = self.head.to(dev)\n",
-    "\n",
-    "        x = fused.view(fused.size(0), fused.size(1), 1, 1)  # [B, C, 1, 1]\n",
-    "        x = self.se(x).view(fused.size(0), -1)              # [B, C]\n",
-    "        logits = self.head(x)                               # [B, 1] or [B, num_labels]\n",
-    "\n",
-    "        out = {\"logits\": logits}\n",
-    "        if labels is not None:\n",
-    "            y = labels.float().view(-1, 1) if logits.size(1) == 1 else labels.float()\n",
-    "            out[\"loss\"] = self.loss_fn(logits, y)\n",
-    "        if not self.use_logits:\n",
-    "            out[\"probs\"] = torch.sigmoid(logits)\n",
-    "        return out\n",
-    "\n",
-    "\n",
-    "# -------------------------------------------------\n",
-    "# Sequential fusion hybrid\n",
-    "# -------------------------------------------------\n",
-    "\n",
-    "class SequentialHybridClassifier(nn.Module):\n",
-    "    \"\"\"\n",
-    "    Sequential fusion hybrid:\n",
-    "    - CNN backbone produces a high-dim vector\n",
-    "    - Project that vector to a 32x32 spatial map\n",
-    "    - Upsample to a pseudo image and feed it into the ViT\n",
-    "    - Then apply SE + head\n",
-    "\n",
-    "    This simulates \"CNN then ViT\" information flow.\n",
-    "    \"\"\"\n",
-    "    def __init__(\n",
-    "        self,\n",
-    "        cnn_extractor: nn.Module,\n",
-    "        vit_extractor: nn.Module,\n",
-    "        num_labels: int = 1,\n",
-    "        se_ratio: int = 8,\n",
-    "        dropout1: float = 0.4,\n",
-    "        dropout2: float = 0.15,\n",
-    "        loss_fn: nn.Module = None,\n",
-    "        use_logits: bool = True,\n",
-    "        feat_dim: int = None,\n",
-    "    ):\n",
-    "        super().__init__()\n",
-    "        self.cnn_feat = cnn_extractor\n",
-    "        self.vit_feat = vit_extractor\n",
-    "        self.channel_reduction = nn.Conv2d(in_channels=1, out_channels=3, kernel_size=1)\n",
-    "\n",
-    "        # Projection layers for different CNN feature dimensions (DenseNet201 ~1920, Xception ~2048)\n",
-    "        self.proj2048 = nn.Linear(2048, 1024)\n",
-    "        self.proj1920 = nn.Linear(1920, 1024)\n",
-    "\n",
-    "        self.use_logits = use_logits\n",
-    "        self.loss_fn = loss_fn or nn.BCEWithLogitsLoss()\n",
-    "\n",
-    "        self._head_cfg = dict(\n",
-    "            num_labels=num_labels,\n",
-    "            se_ratio=se_ratio,\n",
-    "            d1=dropout1,\n",
-    "            d2=dropout2,\n",
-    "        )\n",
-    "        self._head_built = feat_dim is not None\n",
-    "        if self._head_built:\n",
-    "            self._build_head(feat_dim, **self._head_cfg)\n",
-    "\n",
-    "    def _build_head(self, feat_dim: int, num_labels: int, se_ratio: int, d1: float, d2: float):\n",
-    "        self.se = SqueezeExcitation(feat_dim, ratio=se_ratio)\n",
-    "        self.head = nn.Sequential(\n",
-    "            nn.Linear(feat_dim, 512),\n",
-    "            nn.ReLU(inplace=True),\n",
-    "            nn.BatchNorm1d(512),\n",
-    "            nn.Dropout(d1),\n",
-    "            nn.Linear(512, 256),\n",
-    "            nn.ReLU(inplace=True),\n",
-    "            nn.BatchNorm1d(256),\n",
-    "            nn.Dropout(d2),\n",
-    "            nn.Linear(256, num_labels),\n",
-    "        )\n",
-    "        self._head_built = True\n",
-    "\n",
-    "    def forward(self, pixel_values: torch.Tensor, labels: torch.Tensor = None):\n",
-    "        # Step 1. CNN feature vector, shape [B, C]\n",
-    "        cnn_vec = self.cnn_feat(pixel_values)\n",
-    "        C = cnn_vec.shape[1]\n",
-    "\n",
-    "        # Step 2. Project to fixed width 1024\n",
-    "        if C == 1920:\n",
-    "            x = self.proj1920(cnn_vec)\n",
-    "        elif C == 2048:\n",
-    "            x = self.proj2048(cnn_vec)\n",
-    "        else:\n",
-    "            # fallback: build a generic projection on the fly\n",
-    "            if not hasattr(self, \"proj_generic\") or self.proj_generic.in_features != C:\n",
-    "                self.proj_generic = nn.Linear(C, 1024).to(cnn_vec.device)\n",
-    "            x = self.proj_generic(cnn_vec)\n",
-    "\n",
-    "        # Step 3. Reshape [B, 1024] -> [B, 1, 32, 32]\n",
-    "        x = x.reshape(-1, 32, 32, 1).permute(0, 3, 1, 2).contiguous()\n",
-    "\n",
-    "        # Step 4. Upsample to ViT resolution [B, 1, 224, 224] then 1x1 conv to 3 channels\n",
-    "        fmap = F.interpolate(x, size=(224, 224), mode=\"bilinear\", align_corners=False)\n",
-    "        fmap_rgb = self.channel_reduction(fmap)  # [B, 3, 224, 224]\n",
-    "\n",
-    "        # Step 5. Pass through ViT feature extractor to get [B, D]\n",
-    "        vit_feats = self.vit_feat(fmap_rgb)\n",
-    "\n",
-    "        if not self._head_built:\n",
-    "            self._build_head(vit_feats.size(1), **self._head_cfg)\n",
-    "            dev = vit_feats.device\n",
-    "            self.se = self.se.to(dev)\n",
-    "            self.head = self.head.to(dev)\n",
-    "\n",
-    "        # Step 6. Channel attention + head\n",
-    "        v2 = vit_feats.view(vit_feats.size(0), vit_feats.size(1), 1, 1)\n",
-    "        v2 = self.se(v2).view(vit_feats.size(0), -1)\n",
-    "        logits = self.head(v2)\n",
-    "\n",
-    "        out = {\"logits\": logits}\n",
-    "        if labels is not None:\n",
-    "            y = labels.float().view(-1, 1) if logits.size(1) == 1 else labels.float()\n",
-    "            out[\"loss\"] = self.loss_fn(logits, y)\n",
-    "        if not self.use_logits:\n",
-    "            out[\"probs\"] = torch.sigmoid(logits)\n",
-    "        return out\n"
-   ]
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python 3 (ipykernel)",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.11.5"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 5
-}
+# -*- coding: utf-8 -*-
+"""hybrid_vision.ipynb
+
+Automatically generated by Colab.
+
+Original file is located at
+    https://colab.research.google.com/drive/1rHNCCFII867Jd-MHre4e28FdTHs2ToN3
+"""
+
+"""
+hybrid_vision.py
+
+Core model components used in the paper:
+1. CNN classifiers (Xception, DenseNet201)
+2. ViT / DeiT classifiers
+3. Feature extractors for CNN and ViT backbones
+4. Parallel and Sequential CNN–ViT hybrid architectures
+
+These classes are sufficient to:
+- Recreate the hybrid models used in the study
+- Load pretrained checkpoints
+- Run inference and evaluation
+
+Author: [Your name]
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import timm
+from transformers import DeiTModel, ViTModel
+
+
+# -------------------------
+# Backbone classifiers
+# -------------------------
+
+class XceptionClassifier(nn.Module):
+    """
+    CNN baseline using an ImageNet pretrained Xception-style backbone (timm 'legacy_xception').
+    Outputs a single logit for binary classification.
+    """
+    def __init__(self, dropout: float = 0.3):
+        super().__init__()
+        self.backbone = timm.create_model(
+            "legacy_xception",
+            pretrained=True,
+            num_classes=0,          # no classifier head
+            global_pool="avg"
+        )
+        in_feats = self.backbone.num_features
+        self.classifier = nn.Sequential(
+            nn.Linear(in_feats, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(1024, 1)
+        )
+        self.loss_fn = nn.BCEWithLogitsLoss()
+
+    def forward(self, pixel_values: torch.Tensor, labels: torch.Tensor = None):
+        feats = self.backbone(pixel_values)          # [B, F]
+        logits = self.classifier(feats)              # [B, 1]
+
+        out = {"logits": logits}
+        if labels is not None:
+            labels = labels.float().view(-1, 1)
+            out["loss"] = self.loss_fn(logits, labels)
+        return out
+
+
+class DenseNet201Classifier(nn.Module):
+    """
+    CNN baseline using an ImageNet pretrained DenseNet-201 backbone.
+    Same head shape as XceptionClassifier for consistency.
+    """
+    def __init__(self, dropout: float = 0.3):
+        super().__init__()
+        self.backbone = timm.create_model(
+            "densenet201.tv_in1k",
+            pretrained=True,
+            num_classes=0,
+            global_pool="avg"
+        )
+        in_feats = self.backbone.num_features
+        self.classifier = nn.Sequential(
+            nn.Linear(in_feats, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(1024, 1)
+        )
+        self.loss_fn = nn.BCEWithLogitsLoss()
+
+    def forward(self, pixel_values: torch.Tensor, labels: torch.Tensor = None):
+        feats = self.backbone(pixel_values)          # [B, F]
+        logits = self.classifier(feats)              # [B, 1]
+
+        out = {"logits": logits}
+        if labels is not None:
+            labels = labels.float().view(-1, 1)
+            out["loss"] = self.loss_fn(logits, labels)
+        return out
+
+
+class DeiTClassifier(nn.Module):
+    """
+    Transformer baseline using a DeiT backbone (distilled DeiT-base).
+    Returns a single logit for binary classification.
+    """
+    def __init__(self, model_name: str = "facebook/deit-base-distilled-patch16-224", dropout: float = 0.3):
+        super().__init__()
+        self.vit = DeiTModel.from_pretrained(model_name, ignore_mismatched_sizes=True)
+        self.head = nn.Sequential(
+            nn.Linear(768, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(512, 1)
+        )
+        self.loss_fn = nn.BCEWithLogitsLoss()
+
+    def forward(self, pixel_values: torch.Tensor, labels: torch.Tensor = None):
+        cls_token = self.vit(pixel_values=pixel_values).last_hidden_state[:, 0, :]  # [B, 768]
+        logits = self.head(cls_token)                                               # [B, 1]
+
+        out = {"logits": logits}
+        if labels is not None:
+            out["loss"] = self.loss_fn(logits, labels)
+        return out
+
+
+class ViTClassifier(nn.Module):
+    """
+    Transformer baseline using a ViT backbone (e.g. ViT-B/16).
+    Mirrors DeiTClassifier but swaps the pretrained backbone.
+    """
+    def __init__(self, model_name: str = "google/vit-base-patch16-224", dropout: float = 0.3):
+        super().__init__()
+        self.vit = ViTModel.from_pretrained(model_name, ignore_mismatched_sizes=True)
+        self.head = nn.Sequential(
+            nn.Linear(768, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(512, 1)
+        )
+        self.loss_fn = nn.BCEWithLogitsLoss()
+
+    def forward(self, pixel_values: torch.Tensor, labels: torch.Tensor = None):
+        cls_token = self.vit(pixel_values=pixel_values).last_hidden_state[:, 0, :]  # [B, 768]
+        logits = self.head(cls_token)                                               # [B, 1]
+
+        out = {"logits": logits}
+        if labels is not None:
+            out["loss"] = self.loss_fn(logits, labels)
+        return out
+
+
+# -------------------------------------------------
+# Freezing strategy for partial fine-tuning
+# -------------------------------------------------
+
+def set_trainable_fraction(
+    model: nn.Module,
+    kind: str = "vit",
+    fraction: float = 0.6,
+    freeze_embeddings: bool = True,
+    keep_stem_frozen: bool = True,
+):
+    """
+    Partially unfreezes only the last `fraction` of the backbone blocks.
+
+    kind="vit": works with HuggingFace DeiT / ViT or timm ViT.
+    kind="cnn": works with timm CNN backbones.
+
+    After this call:
+    - most of the backbone is frozen
+    - classifier / head layers are still trainable
+    """
+    # unwrap DataParallel if present
+    if hasattr(model, "module"):
+        model = model.module
+
+    # freeze everything first
+    for p in model.parameters():
+        p.requires_grad = False
+
+    if kind == "vit":
+        vit = getattr(model, "vit", None)
+        blocks = None
+
+        if vit is not None:
+            # HuggingFace structure
+            if hasattr(vit, "encoder") and hasattr(vit.encoder, "layer"):
+                blocks = list(vit.encoder.layer)
+            # timm-style ViT
+            elif hasattr(vit, "blocks"):
+                blocks = list(vit.blocks)
+
+        if blocks is None:
+            raise ValueError("ViT blocks not found")
+
+        n = len(blocks)
+        k = max(1, int(round(fraction * n)))
+        cutoff = n - k
+
+        for i, blk in enumerate(blocks):
+            if i >= cutoff:
+                for p in blk.parameters():
+                    p.requires_grad = True
+
+        # final norms / pooler
+        for mod in [getattr(vit, "layernorm", None), getattr(vit, "pooler", None)]:
+            if mod is not None:
+                for p in mod.parameters():
+                    p.requires_grad = True
+
+        # optionally unfreeze embeddings
+        if not freeze_embeddings and hasattr(vit, "embeddings"):
+            for p in vit.embeddings.parameters():
+                p.requires_grad = True
+
+    elif kind == "cnn":
+        bb = getattr(model, "backbone", model)
+        if hasattr(bb, "blocks"):
+            blocks = list(bb.blocks)
+        elif hasattr(bb, "features"):
+            blocks = list(bb.features)
+        else:
+            blocks = [m for m in bb.children()]
+
+        n = len(blocks)
+        k = max(1, int(round(fraction * n)))
+        cutoff = n - k
+
+        for i, blk in enumerate(blocks):
+            if i >= cutoff:
+                for p in blk.parameters():
+                    p.requires_grad = True
+
+        if not keep_stem_frozen and hasattr(bb, "stem"):
+            for p in bb.stem.parameters():
+                p.requires_grad = True
+
+    else:
+        raise ValueError("kind must be 'vit' or 'cnn'")
+
+    # always keep classifier / head trainable
+    for name in ["classifier", "head"]:
+        if hasattr(model, name):
+            for p in getattr(model, name).parameters():
+                p.requires_grad = True
+
+
+# -------------------------------------------------
+# Feature extraction blocks used by the hybrids
+# -------------------------------------------------
+
+class CNNExtractor(nn.Module):
+    """
+    Wraps a CNN classifier or backbone and returns a pooled feature vector [B, C].
+    Removes the final classification head and exposes features only.
+    """
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        # Some classifiers store the CNN in .backbone, others are the backbone directly
+        self.backbone = getattr(model, "backbone", model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # timm CNNs often expose forward_features()
+        if hasattr(self.backbone, "forward_features"):
+            out = self.backbone.forward_features(x)
+
+            # timm DenseNet / EfficientNet style outputs
+            if isinstance(out, dict) and "global_pool" in out:
+                return out["global_pool"]  # [B, C]
+
+            # if we still have [B, C, H, W], apply global pooling
+            if isinstance(out, torch.Tensor) and out.ndim == 4:
+                out = F.adaptive_avg_pool2d(out, 1).flatten(1)
+            return out  # [B, C]
+
+        # fallback: just call the module, assume it returns embeddings
+        return self.backbone(x)
+
+
+class ViTFeatureLayer(nn.Module):
+    """
+    Wraps a DeiT/ViT model and returns the CLS token embedding [B, D],
+    with optional dropout for regularization.
+    """
+    def __init__(self, vit_model: nn.Module, dropout_p: float = 0.1):
+        super().__init__()
+        # Some wrappers store the transformer in .vit already
+        self.vit = getattr(vit_model, "vit", vit_model)
+        self.drop = nn.Dropout(dropout_p)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # HuggingFace ViT / DeiT interface
+        if hasattr(self.vit, "config"):
+            out = self.vit(x, return_dict=True)
+            cls_token = out.last_hidden_state[:, 0]        # [B, D]
+            return self.drop(cls_token)
+
+        # timm ViT interface
+        if hasattr(self.vit, "forward_features"):
+            feats = self.vit.forward_features(x)
+
+            # timm sometimes returns dicts
+            if isinstance(feats, dict):
+                token = feats.get("x", None)
+                if token is None:
+                    # fallback: first 2D tensor in dict
+                    for v in feats.values():
+                        if isinstance(v, torch.Tensor) and v.ndim == 2:
+                            token = v
+                            break
+                cls_token = token
+            else:
+                # tensor
+                if feats.ndim == 3:
+                    cls_token = feats[:, 0]                # [B, D]
+                else:
+                    cls_token = feats                      # already [B, D]
+
+            return self.drop(cls_token)
+
+        raise ValueError("Unsupported ViT model type for feature extraction")
+
+
+# -------------------------------------------------
+# Attention fusion blocks used inside hybrids
+# -------------------------------------------------
+
+class SqueezeExcitation(nn.Module):
+    """
+    Lightweight channel attention used to reweight fused CNN/ViT features.
+    """
+    def __init__(self, channels: int, ratio: int = 8):
+        super().__init__()
+        hidden = max(1, channels // ratio)
+        self.avg = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Linear(channels, hidden, bias=False)
+        self.fc2 = nn.Linear(hidden, channels, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, H, W]
+        b, c, _, _ = x.shape
+        y = self.avg(x).view(b, c)               # [B, C]
+        y = F.relu(self.fc1(y), inplace=True)
+        y = torch.sigmoid(self.fc2(y)).view(b, c, 1, 1)
+        return x * y
+
+
+# -------------------------------------------------
+# Parallel fusion hybrid
+# -------------------------------------------------
+
+class ParallelHybridClassifier(nn.Module):
+    """
+    Parallel fusion hybrid:
+    - Extract CNN features and ViT features independently
+    - Concatenate
+    - Apply SE attention and MLP head
+    """
+    def __init__(
+        self,
+        cnn_extractor: nn.Module,
+        vit_extractor: nn.Module,
+        num_labels: int = 1,
+        se_ratio: int = 8,
+        dropout1: float = 0.4,
+        dropout2: float = 0.15,
+        loss_fn: nn.Module = None,
+        use_logits: bool = True,
+        feat_dim: int = None,
+    ):
+        super().__init__()
+        self.cnn_feat = cnn_extractor
+        self.vit_feat = vit_extractor
+        self.use_logits = use_logits
+        self.loss_fn = loss_fn or nn.BCEWithLogitsLoss()
+
+        # store head config for lazy construction
+        self._head_cfg = dict(
+            num_labels=num_labels,
+            se_ratio=se_ratio,
+            d1=dropout1,
+            d2=dropout2,
+        )
+        self._head_built = feat_dim is not None
+        if self._head_built:
+            self._build_head(feat_dim, **self._head_cfg)
+
+    def _build_head(self, feat_dim: int, num_labels: int, se_ratio: int, d1: float, d2: float):
+        self.se = SqueezeExcitation(feat_dim, ratio=se_ratio)
+        self.head = nn.Sequential(
+            nn.Linear(feat_dim, 512),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(512),
+            nn.Dropout(d1),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(256),
+            nn.Dropout(d2),
+            nn.Linear(256, num_labels),
+        )
+        self._head_built = True
+
+    def forward(self, pixel_values: torch.Tensor, labels: torch.Tensor = None):
+        f_cnn = self.cnn_feat(pixel_values)      # [B, Cc]
+        f_vit = self.vit_feat(pixel_values)      # [B, Cv]
+        fused = torch.cat([f_cnn, f_vit], dim=1) # [B, Cc+Cv]
+
+        if not self._head_built:
+            self._build_head(fused.size(1), **self._head_cfg)
+            # move dynamically created layers to correct device
+            dev = fused.device
+            self.se = self.se.to(dev)
+            self.head = self.head.to(dev)
+
+        x = fused.view(fused.size(0), fused.size(1), 1, 1)  # [B, C, 1, 1]
+        x = self.se(x).view(fused.size(0), -1)              # [B, C]
+        logits = self.head(x)                               # [B, 1] or [B, num_labels]
+
+        out = {"logits": logits}
+        if labels is not None:
+            y = labels.float().view(-1, 1) if logits.size(1) == 1 else labels.float()
+            out["loss"] = self.loss_fn(logits, y)
+        if not self.use_logits:
+            out["probs"] = torch.sigmoid(logits)
+        return out
+
+
+# -------------------------------------------------
+# Sequential fusion hybrid
+# -------------------------------------------------
+
+class SequentialHybridClassifier(nn.Module):
+    """
+    Sequential fusion hybrid:
+    - CNN backbone produces a high-dim vector
+    - Project that vector to a 32x32 spatial map
+    - Upsample to a pseudo image and feed it into the ViT
+    - Then apply SE + head
+
+    This simulates "CNN then ViT" information flow.
+    """
+    def __init__(
+        self,
+        cnn_extractor: nn.Module,
+        vit_extractor: nn.Module,
+        num_labels: int = 1,
+        se_ratio: int = 8,
+        dropout1: float = 0.4,
+        dropout2: float = 0.15,
+        loss_fn: nn.Module = None,
+        use_logits: bool = True,
+        feat_dim: int = None,
+    ):
+        super().__init__()
+        self.cnn_feat = cnn_extractor
+        self.vit_feat = vit_extractor
+        self.channel_reduction = nn.Conv2d(in_channels=1, out_channels=3, kernel_size=1)
+
+        # Projection layers for different CNN feature dimensions (DenseNet201 ~1920, Xception ~2048)
+        self.proj2048 = nn.Linear(2048, 1024)
+        self.proj1920 = nn.Linear(1920, 1024)
+
+        self.use_logits = use_logits
+        self.loss_fn = loss_fn or nn.BCEWithLogitsLoss()
+
+        self._head_cfg = dict(
+            num_labels=num_labels,
+            se_ratio=se_ratio,
+            d1=dropout1,
+            d2=dropout2,
+        )
+        self._head_built = feat_dim is not None
+        if self._head_built:
+            self._build_head(feat_dim, **self._head_cfg)
+
+    def _build_head(self, feat_dim: int, num_labels: int, se_ratio: int, d1: float, d2: float):
+        self.se = SqueezeExcitation(feat_dim, ratio=se_ratio)
+        self.head = nn.Sequential(
+            nn.Linear(feat_dim, 512),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(512),
+            nn.Dropout(d1),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(256),
+            nn.Dropout(d2),
+            nn.Linear(256, num_labels),
+        )
+        self._head_built = True
+
+    def forward(self, pixel_values: torch.Tensor, labels: torch.Tensor = None):
+        # Step 1. CNN feature vector, shape [B, C]
+        cnn_vec = self.cnn_feat(pixel_values)
+        C = cnn_vec.shape[1]
+
+        # Step 2. Project to fixed width 1024
+        if C == 1920:
+            x = self.proj1920(cnn_vec)
+        elif C == 2048:
+            x = self.proj2048(cnn_vec)
+        else:
+            # fallback: build a generic projection on the fly
+            if not hasattr(self, "proj_generic") or self.proj_generic.in_features != C:
+                self.proj_generic = nn.Linear(C, 1024).to(cnn_vec.device)
+            x = self.proj_generic(cnn_vec)
+
+        # Step 3. Reshape [B, 1024] -> [B, 1, 32, 32]
+        x = x.reshape(-1, 32, 32, 1).permute(0, 3, 1, 2).contiguous()
+
+        # Step 4. Upsample to ViT resolution [B, 1, 224, 224] then 1x1 conv to 3 channels
+        fmap = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+        fmap_rgb = self.channel_reduction(fmap)  # [B, 3, 224, 224]
+
+        # Step 5. Pass through ViT feature extractor to get [B, D]
+        vit_feats = self.vit_feat(fmap_rgb)
+
+        if not self._head_built:
+            self._build_head(vit_feats.size(1), **self._head_cfg)
+            dev = vit_feats.device
+            self.se = self.se.to(dev)
+            self.head = self.head.to(dev)
+
+        # Step 6. Channel attention + head
+        v2 = vit_feats.view(vit_feats.size(0), vit_feats.size(1), 1, 1)
+        v2 = self.se(v2).view(vit_feats.size(0), -1)
+        logits = self.head(v2)
+
+        out = {"logits": logits}
+        if labels is not None:
+            y = labels.float().view(-1, 1) if logits.size(1) == 1 else labels.float()
+            out["loss"] = self.loss_fn(logits, y)
+        if not self.use_logits:
+            out["probs"] = torch.sigmoid(logits)
+        return out

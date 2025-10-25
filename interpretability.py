@@ -1,468 +1,443 @@
-{
- "cells": [
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "e457f0f6",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "\"\"\"\n",
-    "interpretability.py\n",
-    "\n",
-    "Utility functions for generating visual explanations from CNN–ViT hybrid\n",
-    "wrist anomaly detectors. These functions were used to produce the\n",
-    "saliency overlays and attention maps reported in the paper.\n",
-    "\n",
-    "Contents:\n",
-    "  - get_vit_attention: Attention rollout / attention-based relevance map\n",
-    "    from the Transformer branch (CLS token backprojection).\n",
-    "  - layercam / layercam_multi: LayerCAM-style gradient-weighted\n",
-    "    activation maps from CNN layers.\n",
-    "  - overlay_heat / to_uint8_img: Utilities for producing overlays.\n",
-    "\n",
-    "References:\n",
-    "  - Jetley et al., 2018. Learn to Pay Attention.\n",
-    "  - Selvaraju et al., 2019. Grad-CAM: Visual Explanations from Deep Networks\n",
-    "    via Gradient-based Localization.\n",
-    "  - Jiang et al., 2021. LayerCAM: Exploring Hierarchical Class Activation Map\n",
-    "    for Localization.\n",
-    "\n",
-    "These implementations are provided for interpretability and reproducibility.\n",
-    "\"\"\"\n",
-    "\n",
-    "import math\n",
-    "import inspect\n",
-    "from collections import deque\n",
-    "from typing import Optional, Callable, Tuple, Union, List\n",
-    "\n",
-    "import numpy as np\n",
-    "import torch\n",
-    "import torch.nn as nn\n",
-    "import torch.nn.functional as F\n",
-    "\n",
-    "\n",
-    "TensorLike = Union[np.ndarray, torch.Tensor]\n",
-    "\n",
-    "\n",
-    "def _get_logits(out: Union[dict, torch.Tensor]) -> torch.Tensor:\n",
-    "    \"\"\"\n",
-    "    Helper to extract a [B, num_classes] logits tensor from either:\n",
-    "    - a dict with \"logits\" (model outputs in our hybrids), or\n",
-    "    - a raw tensor.\n",
-    "    \"\"\"\n",
-    "    if isinstance(out, dict):\n",
-    "        if \"logits\" in out:\n",
-    "            return out[\"logits\"]\n",
-    "        for v in out.values():\n",
-    "            if isinstance(v, torch.Tensor) and v.ndim >= 2:\n",
-    "                return v\n",
-    "        raise ValueError(\"No logits in output dict\")\n",
-    "    if isinstance(out, torch.Tensor):\n",
-    "        return out\n",
-    "    raise ValueError(f\"Unsupported output type {type(out)}\")\n",
-    "\n",
-    "\n",
-    "def _to_tensor_nchw(x: TensorLike) -> torch.Tensor:\n",
-    "    \"\"\"\n",
-    "    Convert input image x into a float32 torch tensor of shape [1, 3, H, W].\n",
-    "    Accepts:\n",
-    "      [H, W]\n",
-    "      [H, W, 1] or [H, W, 3]\n",
-    "      [C, H, W] with C in {1, 3}\n",
-    "      [B, C, H, W] (returned as-is if B==1)\n",
-    "    \"\"\"\n",
-    "    t = torch.from_numpy(x) if isinstance(x, np.ndarray) else x\n",
-    "    if t.ndim == 2:\n",
-    "        # [H, W] -> [1, 3, H, W]\n",
-    "        t = t.unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1)\n",
-    "    elif t.ndim == 3:\n",
-    "        # Could be [C, H, W] or [H, W, C]\n",
-    "        if t.shape[0] in (1, 3):\n",
-    "            # [C, H, W] -> [1, C, H, W]\n",
-    "            t = t.unsqueeze(0)\n",
-    "            if t.shape[1] == 1:\n",
-    "                # replicate single channel to 3\n",
-    "                t = t.repeat(1, 3, 1, 1)\n",
-    "        else:\n",
-    "            # [H, W, C] -> [1, C, H, W]\n",
-    "            t = t.permute(2, 0, 1).unsqueeze(0)\n",
-    "    elif t.ndim != 4:\n",
-    "        raise ValueError(f\"Unsupported input shape {tuple(t.shape)}\")\n",
-    "    return t.float()\n",
-    "\n",
-    "\n",
-    "def _get_hw(x: TensorLike) -> Tuple[int, int]:\n",
-    "    \"\"\"\n",
-    "    Infer spatial size (H, W) from an input tensor/array in any of the allowed shapes.\n",
-    "    \"\"\"\n",
-    "    a = x if isinstance(x, torch.Tensor) else np.asarray(x)\n",
-    "    if a.ndim == 2:\n",
-    "        return a.shape[-2], a.shape[-1]\n",
-    "    if a.ndim == 3:\n",
-    "        # could be [C, H, W] or [H, W, C]\n",
-    "        if isinstance(x, torch.Tensor) and x.shape[0] in (1, 3):\n",
-    "            return a.shape[-2], a.shape[-1]\n",
-    "        return a.shape[-3], a.shape[-2]\n",
-    "    if a.ndim == 4:\n",
-    "        return a.shape[-2], a.shape[-1]\n",
-    "    raise ValueError(\"Could not infer H,W\")\n",
-    "\n",
-    "\n",
-    "def to_uint8_img(x: TensorLike) -> np.ndarray:\n",
-    "    \"\"\"\n",
-    "    Convert a float/torch image tensor in [0,1] or arbitrary range\n",
-    "    into a uint8 RGB array of shape [H, W, 3] suitable for saving or overlay.\n",
-    "    \"\"\"\n",
-    "    t = torch.from_numpy(x) if isinstance(x, np.ndarray) else x\n",
-    "    if t.ndim == 3 and t.shape[0] in (1, 3):\n",
-    "        t = t.permute(1, 2, 0)\n",
-    "    t = t.detach().cpu().float()\n",
-    "\n",
-    "    # if single-channel, repeat to RGB\n",
-    "    if t.ndim == 2:\n",
-    "        t = t.unsqueeze(-1).repeat(1, 1, 3)\n",
-    "\n",
-    "    t_min, t_max = t.min(), t.max()\n",
-    "    if t_min < 0 or t_max > 1:\n",
-    "        # normalize to [0,1]\n",
-    "        t = (t - t_min) / (t_max - t_min + 1e-8)\n",
-    "\n",
-    "    return (t.clamp(0, 1).numpy() * 255.0).astype(np.uint8)\n",
-    "\n",
-    "\n",
-    "def overlay_heat(\n",
-    "    img_uint8: np.ndarray,\n",
-    "    heatmap: TensorLike,\n",
-    "    cmap: str = \"viridis\",\n",
-    "    alpha: float = 0.5,\n",
-    ") -> np.ndarray:\n",
-    "    \"\"\"\n",
-    "    Alpha-blend a heatmap on top of an RGB uint8 image.\n",
-    "    Returns a uint8 RGB overlay. Does not display or save.\n",
-    "    \"\"\"\n",
-    "    from matplotlib import cm\n",
-    "\n",
-    "    h = heatmap.detach().cpu().numpy() if torch.is_tensor(heatmap) else np.asarray(heatmap)\n",
-    "    h = (h - h.min()) / (h.max() - h.min() + 1e-8)\n",
-    "\n",
-    "    heat_rgb = (cm.get_cmap(cmap)(h)[..., :3] * 255.0).astype(np.uint8)\n",
-    "    out = (\n",
-    "        img_uint8.astype(np.float32) * (1 - alpha)\n",
-    "        + heat_rgb.astype(np.float32) * alpha\n",
-    "    ).clip(0, 255)\n",
-    "\n",
-    "    return out.astype(np.uint8)\n",
-    "\n",
-    "\n",
-    "def _unwrap_hf_vit(module: nn.Module) -> nn.Module:\n",
-    "    \"\"\"\n",
-    "    If vit_backbone(...) doesn't directly accept output_attentions=True,\n",
-    "    walk down into submodules to find the part that does (for some HF models).\n",
-    "    \"\"\"\n",
-    "    q, seen = deque([module])\n",
-    "    while q:\n",
-    "        m = q.popleft()\n",
-    "        if id(m) in seen:\n",
-    "            continue\n",
-    "        seen.add(id(m))\n",
-    "\n",
-    "        try:\n",
-    "            if \"output_attentions\" in inspect.signature(m.forward).parameters:\n",
-    "                return m\n",
-    "        except Exception:\n",
-    "            pass\n",
-    "\n",
-    "        # search typical attribute names used in DeiT / ViT wrappers\n",
-    "        for name in (\"model\", \"backbone\", \"deit\", \"encoder\", \"transformer\"):\n",
-    "            if hasattr(m, name):\n",
-    "                sub = getattr(m, name)\n",
-    "                if isinstance(sub, nn.Module):\n",
-    "                    q.append(sub)\n",
-    "\n",
-    "        for c in m.children():\n",
-    "            q.append(c)\n",
-    "\n",
-    "    raise TypeError(\"No DeiT-like submodule with output_attentions found\")\n",
-    "\n",
-    "\n",
-    "@torch.no_grad()\n",
-    "def get_vit_attention(\n",
-    "    vit_backbone: nn.Module,\n",
-    "    img: TensorLike,\n",
-    "    discard_ratio: float = 0.1,\n",
-    "    preprocess: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,\n",
-    "    device: Optional[torch.device] = None,\n",
-    ") -> torch.Tensor:\n",
-    "    \"\"\"\n",
-    "    Generate a spatial attention/relevance map from a ViT/DeiT-like model.\n",
-    "\n",
-    "    Steps (attention rollout style):\n",
-    "    1. Forward the image through the ViT with output_attentions=True.\n",
-    "    2. Average heads, keep strongest connections (optionally discard low weights).\n",
-    "    3. Multiply attention matrices layer by layer to propagate CLS token relevance.\n",
-    "    4. Drop CLS / distillation tokens, reshape the remaining tokens back to a grid.\n",
-    "    5. Upsample to the original HxW.\n",
-    "\n",
-    "    Returns:\n",
-    "        heatmap [H, W] normalized to [0,1] as a torch.Tensor on CPU.\n",
-    "    \"\"\"\n",
-    "    H, W = _get_hw(img)\n",
-    "    x = _to_tensor_nchw(img)\n",
-    "\n",
-    "    # Optional preprocessing (e.g. normalization)\n",
-    "    if preprocess is not None:\n",
-    "        x = preprocess(x)\n",
-    "\n",
-    "    # Pick device if not given\n",
-    "    if device is None:\n",
-    "        device = next(vit_backbone.parameters()).device\n",
-    "    x = x.to(device)\n",
-    "\n",
-    "    vit_backbone.eval()\n",
-    "\n",
-    "    # Try multiple call signatures depending on model wrapper\n",
-    "    try:\n",
-    "        out = vit_backbone(x, output_attentions=True, return_dict=True)\n",
-    "    except TypeError:\n",
-    "        try:\n",
-    "            out = vit_backbone(pixel_values=x, output_attentions=True, return_dict=True)\n",
-    "        except TypeError:\n",
-    "            core = _unwrap_hf_vit(vit_backbone)\n",
-    "            out = core(pixel_values=x, output_attentions=True, return_dict=True)\n",
-    "\n",
-    "    atts = out.attentions\n",
-    "    if (not atts) or (atts[0].ndim != 4):\n",
-    "        raise RuntimeError(\"No attentions returned from ViT backbone\")\n",
-    "\n",
-    "    # Combine attention across layers\n",
-    "    T = atts[0].shape[-1]  # number of tokens\n",
-    "    rollout = torch.eye(T, dtype=torch.float32, device=x.device)\n",
-    "\n",
-    "    for att in atts:\n",
-    "        # att shape [B, heads, T, T]; take first sample and mean over heads\n",
-    "        a = att[0].mean(dim=0)\n",
-    "\n",
-    "        # keep only top weights if discard_ratio > 0\n",
-    "        if discard_ratio and discard_ratio > 0:\n",
-    "            flat = a.reshape(-1)\n",
-    "            k = int(round(discard_ratio * flat.numel()))\n",
-    "            if 0 < k < flat.numel():\n",
-    "                cutoff = torch.sort(flat, descending=True).values[k]\n",
-    "                a = torch.where(a < cutoff, torch.zeros_like(a), a)\n",
-    "\n",
-    "        # add identity for residual\n",
-    "        a = a + torch.eye(T, device=x.device, dtype=a.dtype)\n",
-    "        # row-normalize\n",
-    "        a = a / a.sum(dim=-1, keepdim=True)\n",
-    "\n",
-    "        rollout = a @ rollout\n",
-    "\n",
-    "    # Some ViT variants prepend 1 or 2 special tokens (CLS, distill)\n",
-    "    # We try to drop them and reshape the rest into a square grid.\n",
-    "    drop = 2 if int(math.isqrt(T - 2)) ** 2 == (T - 2) else 1\n",
-    "    vec = rollout[0, drop:]  # relevance from CLS to spatial tokens only\n",
-    "\n",
-    "    M = vec.numel()\n",
-    "    n = int(math.isqrt(M))\n",
-    "    if n * n != M:\n",
-    "        raise ValueError(f\"Token grid is not square (got {M} tokens)\")\n",
-    "\n",
-    "    grid = vec.reshape(1, 1, n, n)\n",
-    "    grid = F.interpolate(\n",
-    "        grid,\n",
-    "        size=(H, W),\n",
-    "        mode=\"bilinear\",\n",
-    "        align_corners=False,\n",
-    "    )[0, 0]\n",
-    "\n",
-    "    # Normalize to [0,1] and return on CPU\n",
-    "    grid = (grid - grid.min()) / (grid.max() - grid.min() + 1e-8)\n",
-    "    return grid.detach().cpu()\n",
-    "\n",
-    "\n",
-    "def layercam(\n",
-    "    model: nn.Module,\n",
-    "    x: torch.Tensor,\n",
-    "    target_layer: nn.Module,\n",
-    "    class_index: Optional[int] = None,\n",
-    ") -> np.ndarray:\n",
-    "    \"\"\"\n",
-    "    Compute a LayerCAM-style saliency map for a CNN-like model layer.\n",
-    "\n",
-    "    Arguments:\n",
-    "        model: full model that produces logits in forward\n",
-    "        x: input image tensor [1, C, H, W] or [C, H, W]\n",
-    "        target_layer: convolutional layer to probe\n",
-    "        class_index: which class index to backprop.\n",
-    "                     If None, uses argmax (or 0 if binary head)\n",
-    "\n",
-    "    Returns:\n",
-    "        cam: numpy array [H, W] in [0,1]\n",
-    "    \"\"\"\n",
-    "    model.eval()\n",
-    "    device = next(model.parameters()).device\n",
-    "\n",
-    "    # ensure batch dimension\n",
-    "    if x.ndim == 3:\n",
-    "        x = x.unsqueeze(0)\n",
-    "    x = x.to(device)\n",
-    "\n",
-    "    B, C, H, W = x.shape\n",
-    "    assert B == 1, \"layercam expects a single image (batch size 1)\"\n",
-    "\n",
-    "    acts: List[torch.Tensor] = []\n",
-    "    grads: List[torch.Tensor] = []\n",
-    "\n",
-    "    def fwd_hook(_m, _i, o):\n",
-    "        acts.append(o)\n",
-    "\n",
-    "    def bwd_hook(_m, _gi, go):\n",
-    "        grads.append(go[0])\n",
-    "\n",
-    "    h1 = target_layer.register_forward_hook(fwd_hook)\n",
-    "    h2 = target_layer.register_full_backward_hook(bwd_hook)\n",
-    "\n",
-    "    try:\n",
-    "        out = model(x)\n",
-    "        logits = _get_logits(out)\n",
-    "        if logits.ndim != 2:\n",
-    "            raise ValueError(f\"Unexpected logits shape {tuple(logits.shape)}\")\n",
-    "\n",
-    "        # choose which score to explain\n",
-    "        if class_index is None:\n",
-    "            class_index = 0 if logits.shape[1] == 1 else int(torch.argmax(logits, dim=1).item())\n",
-    "\n",
-    "        score = logits[:, class_index].sum()\n",
-    "\n",
-    "        # standard grad-based attribution\n",
-    "        model.zero_grad(set_to_none=True)\n",
-    "        score.backward()\n",
-    "\n",
-    "        A = acts[0].clamp(min=0)    # activations\n",
-    "        G = grads[0].clamp(min=0)   # gradients\n",
-    "\n",
-    "        cam = (A * G).sum(dim=1, keepdim=True)  # [1,1,h,w]\n",
-    "        cam = F.interpolate(cam, size=(H, W), mode=\"bilinear\", align_corners=False)[0, 0]\n",
-    "\n",
-    "        cam = cam - cam.min()\n",
-    "        cam = cam / (cam.max() + 1e-6)\n",
-    "\n",
-    "        return cam.detach().cpu().numpy()\n",
-    "\n",
-    "    finally:\n",
-    "        h1.remove()\n",
-    "        h2.remove()\n",
-    "\n",
-    "\n",
-    "def pick_last_k_convs(\n",
-    "    module: nn.Module,\n",
-    "    k: int = 3,\n",
-    "    include_1x1: bool = False,\n",
-    "):\n",
-    "    \"\"\"\n",
-    "    Collect the last k convolutional layers in a model or submodule.\n",
-    "    Useful for building multi-layer CAM.\n",
-    "    \"\"\"\n",
-    "    convs = []\n",
-    "    for _, m in module.named_modules():\n",
-    "        if isinstance(m, nn.Conv2d):\n",
-    "            if include_1x1:\n",
-    "                convs.append(m)\n",
-    "            else:\n",
-    "                if isinstance(m.kernel_size, tuple):\n",
-    "                    ks = m.kernel_size\n",
-    "                else:\n",
-    "                    ks = (m.kernel_size, m.kernel_size)\n",
-    "                if ks != (1, 1):\n",
-    "                    convs.append(m)\n",
-    "\n",
-    "    if not convs:\n",
-    "        raise ValueError(\"No Conv2d layers found\")\n",
-    "\n",
-    "    # deepest k, but keep returned order shallow -> deep\n",
-    "    return convs[-k:]\n",
-    "\n",
-    "\n",
-    "def layercam_multi(\n",
-    "    model: nn.Module,\n",
-    "    x: torch.Tensor,\n",
-    "    target_layers,\n",
-    "    class_index: Optional[int] = None,\n",
-    "    weights=None,\n",
-    "    combine: str = \"mean\",\n",
-    "    return_all: bool = False,\n",
-    "):\n",
-    "    \"\"\"\n",
-    "    Compute LayerCAM on multiple layers and fuse them.\n",
-    "\n",
-    "    Arguments:\n",
-    "        model: full model\n",
-    "        x: input image [1, C, H, W] or [C, H, W]\n",
-    "        target_layers: list of Conv2d layers (e.g. output of pick_last_k_convs)\n",
-    "        class_index: class to explain (None = argmax/0 default)\n",
-    "        weights: optional list of per-layer weights\n",
-    "        combine: \"mean\", \"sum\", or \"max\"\n",
-    "        return_all: if True, also return per-layer maps\n",
-    "\n",
-    "    Returns:\n",
-    "        fused_map: numpy array [H, W] in [0,1]\n",
-    "        (optionally) list of individual maps\n",
-    "    \"\"\"\n",
-    "    maps = [\n",
-    "        torch.from_numpy(layercam(model, x, L, class_index=class_index))\n",
-    "        for L in target_layers\n",
-    "    ]\n",
-    "    M = torch.stack(maps, dim=0)  # [L, H, W]\n",
-    "\n",
-    "    # optional weighting\n",
-    "    if weights is not None:\n",
-    "        w = torch.tensor(weights, dtype=M.dtype)\n",
-    "        w = w / max(w.sum().item(), 1e-6)\n",
-    "        M = M * w.view(-1, 1, 1)\n",
-    "\n",
-    "    # fuse\n",
-    "    if combine == \"max\":\n",
-    "        fused = M.max(dim=0).values\n",
-    "    elif combine == \"sum\":\n",
-    "        fused = M.sum(dim=0)\n",
-    "    else:\n",
-    "        fused = M.mean(dim=0)\n",
-    "\n",
-    "    fused = fused - fused.min()\n",
-    "    fused = fused / max(fused.max().item(), 1e-6)\n",
-    "\n",
-    "    if return_all:\n",
-    "        per_layer = []\n",
-    "        for t in maps:\n",
-    "            tt = t - t.min()\n",
-    "            tt = tt / max(tt.max().item(), 1e-6)\n",
-    "            per_layer.append(tt.numpy())\n",
-    "        return fused.numpy(), per_layer\n",
-    "\n",
-    "    return fused.numpy()\n"
-   ]
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python 3 (ipykernel)",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.11.5"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 5
-}
+# -*- coding: utf-8 -*-
+"""interpretability.ipynb
+
+Automatically generated by Colab.
+
+Original file is located at
+    https://colab.research.google.com/drive/1vyNgG1gRCpE1qs0_QuAxWhpZUCRq4K4o
+"""
+
+"""
+interpretability.py
+
+Utility functions for generating visual explanations from CNN–ViT hybrid
+wrist anomaly detectors. These functions were used to produce the
+saliency overlays and attention maps reported in the paper.
+
+Contents:
+  - get_vit_attention: Attention rollout / attention-based relevance map
+    from the Transformer branch (CLS token backprojection).
+  - layercam / layercam_multi: LayerCAM-style gradient-weighted
+    activation maps from CNN layers.
+  - overlay_heat / to_uint8_img: Utilities for producing overlays.
+
+References:
+  - Jetley et al., 2018. Learn to Pay Attention.
+  - Selvaraju et al., 2019. Grad-CAM: Visual Explanations from Deep Networks
+    via Gradient-based Localization.
+  - Jiang et al., 2021. LayerCAM: Exploring Hierarchical Class Activation Map
+    for Localization.
+
+These implementations are provided for interpretability and reproducibility.
+"""
+
+import math
+import inspect
+from collections import deque
+from typing import Optional, Callable, Tuple, Union, List
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+TensorLike = Union[np.ndarray, torch.Tensor]
+
+
+def _get_logits(out: Union[dict, torch.Tensor]) -> torch.Tensor:
+    """
+    Helper to extract a [B, num_classes] logits tensor from either:
+    - a dict with "logits" (model outputs in our hybrids), or
+    - a raw tensor.
+    """
+    if isinstance(out, dict):
+        if "logits" in out:
+            return out["logits"]
+        for v in out.values():
+            if isinstance(v, torch.Tensor) and v.ndim >= 2:
+                return v
+        raise ValueError("No logits in output dict")
+    if isinstance(out, torch.Tensor):
+        return out
+    raise ValueError(f"Unsupported output type {type(out)}")
+
+
+def _to_tensor_nchw(x: TensorLike) -> torch.Tensor:
+    """
+    Convert input image x into a float32 torch tensor of shape [1, 3, H, W].
+    Accepts:
+      [H, W]
+      [H, W, 1] or [H, W, 3]
+      [C, H, W] with C in {1, 3}
+      [B, C, H, W] (returned as-is if B==1)
+    """
+    t = torch.from_numpy(x) if isinstance(x, np.ndarray) else x
+    if t.ndim == 2:
+        # [H, W] -> [1, 3, H, W]
+        t = t.unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1)
+    elif t.ndim == 3:
+        # Could be [C, H, W] or [H, W, C]
+        if t.shape[0] in (1, 3):
+            # [C, H, W] -> [1, C, H, W]
+            t = t.unsqueeze(0)
+            if t.shape[1] == 1:
+                # replicate single channel to 3
+                t = t.repeat(1, 3, 1, 1)
+        else:
+            # [H, W, C] -> [1, C, H, W]
+            t = t.permute(2, 0, 1).unsqueeze(0)
+    elif t.ndim != 4:
+        raise ValueError(f"Unsupported input shape {tuple(t.shape)}")
+    return t.float()
+
+
+def _get_hw(x: TensorLike) -> Tuple[int, int]:
+    """
+    Infer spatial size (H, W) from an input tensor/array in any of the allowed shapes.
+    """
+    a = x if isinstance(x, torch.Tensor) else np.asarray(x)
+    if a.ndim == 2:
+        return a.shape[-2], a.shape[-1]
+    if a.ndim == 3:
+        # could be [C, H, W] or [H, W, C]
+        if isinstance(x, torch.Tensor) and x.shape[0] in (1, 3):
+            return a.shape[-2], a.shape[-1]
+        return a.shape[-3], a.shape[-2]
+    if a.ndim == 4:
+        return a.shape[-2], a.shape[-1]
+    raise ValueError("Could not infer H,W")
+
+
+def to_uint8_img(x: TensorLike) -> np.ndarray:
+    """
+    Convert a float/torch image tensor in [0,1] or arbitrary range
+    into a uint8 RGB array of shape [H, W, 3] suitable for saving or overlay.
+    """
+    t = torch.from_numpy(x) if isinstance(x, np.ndarray) else x
+    if t.ndim == 3 and t.shape[0] in (1, 3):
+        t = t.permute(1, 2, 0)
+    t = t.detach().cpu().float()
+
+    # if single-channel, repeat to RGB
+    if t.ndim == 2:
+        t = t.unsqueeze(-1).repeat(1, 1, 3)
+
+    t_min, t_max = t.min(), t.max()
+    if t_min < 0 or t_max > 1:
+        # normalize to [0,1]
+        t = (t - t_min) / (t_max - t_min + 1e-8)
+
+    return (t.clamp(0, 1).numpy() * 255.0).astype(np.uint8)
+
+
+def overlay_heat(
+    img_uint8: np.ndarray,
+    heatmap: TensorLike,
+    cmap: str = "viridis",
+    alpha: float = 0.5,
+) -> np.ndarray:
+    """
+    Alpha-blend a heatmap on top of an RGB uint8 image.
+    Returns a uint8 RGB overlay. Does not display or save.
+    """
+    from matplotlib import cm
+
+    h = heatmap.detach().cpu().numpy() if torch.is_tensor(heatmap) else np.asarray(heatmap)
+    h = (h - h.min()) / (h.max() - h.min() + 1e-8)
+
+    heat_rgb = (cm.get_cmap(cmap)(h)[..., :3] * 255.0).astype(np.uint8)
+    out = (
+        img_uint8.astype(np.float32) * (1 - alpha)
+        + heat_rgb.astype(np.float32) * alpha
+    ).clip(0, 255)
+
+    return out.astype(np.uint8)
+
+
+def _unwrap_hf_vit(module: nn.Module) -> nn.Module:
+    """
+    If vit_backbone(...) doesn't directly accept output_attentions=True,
+    walk down into submodules to find the part that does (for some HF models).
+    """
+    q, seen = deque([module])
+    while q:
+        m = q.popleft()
+        if id(m) in seen:
+            continue
+        seen.add(id(m))
+
+        try:
+            if "output_attentions" in inspect.signature(m.forward).parameters:
+                return m
+        except Exception:
+            pass
+
+        # search typical attribute names used in DeiT / ViT wrappers
+        for name in ("model", "backbone", "deit", "encoder", "transformer"):
+            if hasattr(m, name):
+                sub = getattr(m, name)
+                if isinstance(sub, nn.Module):
+                    q.append(sub)
+
+        for c in m.children():
+            q.append(c)
+
+    raise TypeError("No DeiT-like submodule with output_attentions found")
+
+
+@torch.no_grad()
+def get_vit_attention(
+    vit_backbone: nn.Module,
+    img: TensorLike,
+    discard_ratio: float = 0.1,
+    preprocess: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Generate a spatial attention/relevance map from a ViT/DeiT-like model.
+
+    Steps (attention rollout style):
+    1. Forward the image through the ViT with output_attentions=True.
+    2. Average heads, keep strongest connections (optionally discard low weights).
+    3. Multiply attention matrices layer by layer to propagate CLS token relevance.
+    4. Drop CLS / distillation tokens, reshape the remaining tokens back to a grid.
+    5. Upsample to the original HxW.
+
+    Returns:
+        heatmap [H, W] normalized to [0,1] as a torch.Tensor on CPU.
+    """
+    H, W = _get_hw(img)
+    x = _to_tensor_nchw(img)
+
+    # Optional preprocessing (e.g. normalization)
+    if preprocess is not None:
+        x = preprocess(x)
+
+    # Pick device if not given
+    if device is None:
+        device = next(vit_backbone.parameters()).device
+    x = x.to(device)
+
+    vit_backbone.eval()
+
+    # Try multiple call signatures depending on model wrapper
+    try:
+        out = vit_backbone(x, output_attentions=True, return_dict=True)
+    except TypeError:
+        try:
+            out = vit_backbone(pixel_values=x, output_attentions=True, return_dict=True)
+        except TypeError:
+            core = _unwrap_hf_vit(vit_backbone)
+            out = core(pixel_values=x, output_attentions=True, return_dict=True)
+
+    atts = out.attentions
+    if (not atts) or (atts[0].ndim != 4):
+        raise RuntimeError("No attentions returned from ViT backbone")
+
+    # Combine attention across layers
+    T = atts[0].shape[-1]  # number of tokens
+    rollout = torch.eye(T, dtype=torch.float32, device=x.device)
+
+    for att in atts:
+        # att shape [B, heads, T, T]; take first sample and mean over heads
+        a = att[0].mean(dim=0)
+
+        # keep only top weights if discard_ratio > 0
+        if discard_ratio and discard_ratio > 0:
+            flat = a.reshape(-1)
+            k = int(round(discard_ratio * flat.numel()))
+            if 0 < k < flat.numel():
+                cutoff = torch.sort(flat, descending=True).values[k]
+                a = torch.where(a < cutoff, torch.zeros_like(a), a)
+
+        # add identity for residual
+        a = a + torch.eye(T, device=x.device, dtype=a.dtype)
+        # row-normalize
+        a = a / a.sum(dim=-1, keepdim=True)
+
+        rollout = a @ rollout
+
+    # Some ViT variants prepend 1 or 2 special tokens (CLS, distill)
+    # We try to drop them and reshape the rest into a square grid.
+    drop = 2 if int(math.isqrt(T - 2)) ** 2 == (T - 2) else 1
+    vec = rollout[0, drop:]  # relevance from CLS to spatial tokens only
+
+    M = vec.numel()
+    n = int(math.isqrt(M))
+    if n * n != M:
+        raise ValueError(f"Token grid is not square (got {M} tokens)")
+
+    grid = vec.reshape(1, 1, n, n)
+    grid = F.interpolate(
+        grid,
+        size=(H, W),
+        mode="bilinear",
+        align_corners=False,
+    )[0, 0]
+
+    # Normalize to [0,1] and return on CPU
+    grid = (grid - grid.min()) / (grid.max() - grid.min() + 1e-8)
+    return grid.detach().cpu()
+
+
+def layercam(
+    model: nn.Module,
+    x: torch.Tensor,
+    target_layer: nn.Module,
+    class_index: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Compute a LayerCAM-style saliency map for a CNN-like model layer.
+
+    Arguments:
+        model: full model that produces logits in forward
+        x: input image tensor [1, C, H, W] or [C, H, W]
+        target_layer: convolutional layer to probe
+        class_index: which class index to backprop.
+                     If None, uses argmax (or 0 if binary head)
+
+    Returns:
+        cam: numpy array [H, W] in [0,1]
+    """
+    model.eval()
+    device = next(model.parameters()).device
+
+    # ensure batch dimension
+    if x.ndim == 3:
+        x = x.unsqueeze(0)
+    x = x.to(device)
+
+    B, C, H, W = x.shape
+    assert B == 1, "layercam expects a single image (batch size 1)"
+
+    acts: List[torch.Tensor] = []
+    grads: List[torch.Tensor] = []
+
+    def fwd_hook(_m, _i, o):
+        acts.append(o)
+
+    def bwd_hook(_m, _gi, go):
+        grads.append(go[0])
+
+    h1 = target_layer.register_forward_hook(fwd_hook)
+    h2 = target_layer.register_full_backward_hook(bwd_hook)
+
+    try:
+        out = model(x)
+        logits = _get_logits(out)
+        if logits.ndim != 2:
+            raise ValueError(f"Unexpected logits shape {tuple(logits.shape)}")
+
+        # choose which score to explain
+        if class_index is None:
+            class_index = 0 if logits.shape[1] == 1 else int(torch.argmax(logits, dim=1).item())
+
+        score = logits[:, class_index].sum()
+
+        # standard grad-based attribution
+        model.zero_grad(set_to_none=True)
+        score.backward()
+
+        A = acts[0].clamp(min=0)    # activations
+        G = grads[0].clamp(min=0)   # gradients
+
+        cam = (A * G).sum(dim=1, keepdim=True)  # [1,1,h,w]
+        cam = F.interpolate(cam, size=(H, W), mode="bilinear", align_corners=False)[0, 0]
+
+        cam = cam - cam.min()
+        cam = cam / (cam.max() + 1e-6)
+
+        return cam.detach().cpu().numpy()
+
+    finally:
+        h1.remove()
+        h2.remove()
+
+
+def pick_last_k_convs(
+    module: nn.Module,
+    k: int = 3,
+    include_1x1: bool = False,
+):
+    """
+    Collect the last k convolutional layers in a model or submodule.
+    Useful for building multi-layer CAM.
+    """
+    convs = []
+    for _, m in module.named_modules():
+        if isinstance(m, nn.Conv2d):
+            if include_1x1:
+                convs.append(m)
+            else:
+                if isinstance(m.kernel_size, tuple):
+                    ks = m.kernel_size
+                else:
+                    ks = (m.kernel_size, m.kernel_size)
+                if ks != (1, 1):
+                    convs.append(m)
+
+    if not convs:
+        raise ValueError("No Conv2d layers found")
+
+    # deepest k, but keep returned order shallow -> deep
+    return convs[-k:]
+
+
+def layercam_multi(
+    model: nn.Module,
+    x: torch.Tensor,
+    target_layers,
+    class_index: Optional[int] = None,
+    weights=None,
+    combine: str = "mean",
+    return_all: bool = False,
+):
+    """
+    Compute LayerCAM on multiple layers and fuse them.
+
+    Arguments:
+        model: full model
+        x: input image [1, C, H, W] or [C, H, W]
+        target_layers: list of Conv2d layers (e.g. output of pick_last_k_convs)
+        class_index: class to explain (None = argmax/0 default)
+        weights: optional list of per-layer weights
+        combine: "mean", "sum", or "max"
+        return_all: if True, also return per-layer maps
+
+    Returns:
+        fused_map: numpy array [H, W] in [0,1]
+        (optionally) list of individual maps
+    """
+    maps = [
+        torch.from_numpy(layercam(model, x, L, class_index=class_index))
+        for L in target_layers
+    ]
+    M = torch.stack(maps, dim=0)  # [L, H, W]
+
+    # optional weighting
+    if weights is not None:
+        w = torch.tensor(weights, dtype=M.dtype)
+        w = w / max(w.sum().item(), 1e-6)
+        M = M * w.view(-1, 1, 1)
+
+    # fuse
+    if combine == "max":
+        fused = M.max(dim=0).values
+    elif combine == "sum":
+        fused = M.sum(dim=0)
+    else:
+        fused = M.mean(dim=0)
+
+    fused = fused - fused.min()
+    fused = fused / max(fused.max().item(), 1e-6)
+
+    if return_all:
+        per_layer = []
+        for t in maps:
+            tt = t - t.min()
+            tt = tt / max(tt.max().item(), 1e-6)
+            per_layer.append(tt.numpy())
+        return fused.numpy(), per_layer
+
+    return fused.numpy()
