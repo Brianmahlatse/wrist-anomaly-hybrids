@@ -31,6 +31,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from PIL import Image
 from sklearn.metrics import accuracy_score, recall_score, roc_auc_score
+import cv2
 
 
 class SingleImageDataset(Dataset):
@@ -104,6 +105,49 @@ class SingleImageDataset(Dataset):
 # -------------------------------------------------
 # Data augmentation / preprocessing
 # -------------------------------------------------
+
+def preprocess_image_from_row(row, target_shape=(224, 224), to_rgb=False):
+    """
+    Load and preprocess a single radiograph from a dataframe row.
+
+    Args:
+        row: object with attributes (row.img_path, row.label, row.body_part)
+             or a dict-like with the same keys.
+        target_shape: (H, W) to resize to.
+        to_rgb: if True, return 3-channel image (H, W, 3) by stacking.
+
+    Returns:
+        img: np.ndarray, float32, scaled to [0, 1]
+        label: int
+        body_part: str
+    """
+    # support both row.attr and row["key"]
+    img_path = getattr(row, "img_path", None) or row["img_path"]
+    label = getattr(row, "label", None)
+    if label is None:
+        label = row["label"]
+    body_part = getattr(row, "body_part", None)
+    if body_part is None:
+        body_part = row["body_part"]
+
+    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise ValueError(f"Could not load image: {img_path}")
+
+    img = cv2.resize(img, target_shape, interpolation=cv2.INTER_AREA)
+
+    # CLAHE for X-rays
+    clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(8, 8))
+    img = clahe.apply(img)
+
+    img = img.astype(np.float32) / 255.0
+
+    if to_rgb:
+        # (H, W) -> (H, W, 3)
+        img = np.stack([img, img, img], axis=-1)
+
+    return img, int(label), body_part
+
 
 train_transforms = transforms.Compose([
     transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
