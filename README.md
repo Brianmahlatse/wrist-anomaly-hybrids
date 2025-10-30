@@ -15,7 +15,7 @@ This repository enables reproducibility of:
 
 * **Model architectures:** Hybrid CNN–ViT fusion (Parallel / Sequential)
 * **Training utilities:** Multi-stage fine-tuning and layer freezing control
-* **Custom optimizers:** AdamW, RMSprop, and AdaBoB [1]
+* **Custom optimizers:** AdaBoB [1]
 * **Evaluation pipeline:** Image- and patient-level metrics, McNemar and Wilcoxon tests
 * **Interpretability:** LayerCAM [2] and attention rollout [3]
 * **Model loading:** Unified checkpoint loading and reconstruction (`model_loader.py`)
@@ -216,3 +216,4 @@ Mixed-precision (FP16) training and inference were enabled where available.
 [https://doi.org/10.1109/CVPR.2018.00745](https://doi.org/10.1109/CVPR.2018.00745)
 
 ---
+
