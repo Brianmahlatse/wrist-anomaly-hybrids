@@ -31,8 +31,9 @@ References:
 These implementations are provided for interpretability and reproducibility.
 """
 
-import math
-import inspect
+# model_interpretability.py
+
+import math, inspect
 from collections import deque
 from typing import Optional, Callable, Tuple, Union, List
 
@@ -40,17 +41,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from matplotlib import pyplot as plt
 
 TensorLike = Union[np.ndarray, torch.Tensor]
 
 
+# ----------------------------
+# utils
+# ----------------------------
 def _get_logits(out: Union[dict, torch.Tensor]) -> torch.Tensor:
-    """
-    Helper to extract a [B, num_classes] logits tensor from either:
-    - a dict with "logits" (model outputs in our hybrids), or
-    - a raw tensor.
-    """
     if isinstance(out, dict):
         if "logits" in out:
             return out["logits"]
@@ -64,28 +63,15 @@ def _get_logits(out: Union[dict, torch.Tensor]) -> torch.Tensor:
 
 
 def _to_tensor_nchw(x: TensorLike) -> torch.Tensor:
-    """
-    Convert input image x into a float32 torch tensor of shape [1, 3, H, W].
-    Accepts:
-      [H, W]
-      [H, W, 1] or [H, W, 3]
-      [C, H, W] with C in {1, 3}
-      [B, C, H, W] (returned as-is if B==1)
-    """
     t = torch.from_numpy(x) if isinstance(x, np.ndarray) else x
     if t.ndim == 2:
-        # [H, W] -> [1, 3, H, W]
         t = t.unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1)
     elif t.ndim == 3:
-        # Could be [C, H, W] or [H, W, C]
         if t.shape[0] in (1, 3):
-            # [C, H, W] -> [1, C, H, W]
             t = t.unsqueeze(0)
             if t.shape[1] == 1:
-                # replicate single channel to 3
                 t = t.repeat(1, 3, 1, 1)
         else:
-            # [H, W, C] -> [1, C, H, W]
             t = t.permute(2, 0, 1).unsqueeze(0)
     elif t.ndim != 4:
         raise ValueError(f"Unsupported input shape {tuple(t.shape)}")
@@ -93,14 +79,10 @@ def _to_tensor_nchw(x: TensorLike) -> torch.Tensor:
 
 
 def _get_hw(x: TensorLike) -> Tuple[int, int]:
-    """
-    Infer spatial size (H, W) from an input tensor/array in any of the allowed shapes.
-    """
     a = x if isinstance(x, torch.Tensor) else np.asarray(x)
     if a.ndim == 2:
         return a.shape[-2], a.shape[-1]
     if a.ndim == 3:
-        # could be [C, H, W] or [H, W, C]
         if isinstance(x, torch.Tensor) and x.shape[0] in (1, 3):
             return a.shape[-2], a.shape[-1]
         return a.shape[-3], a.shape[-2]
@@ -110,71 +92,59 @@ def _get_hw(x: TensorLike) -> Tuple[int, int]:
 
 
 def to_uint8_img(x: TensorLike) -> np.ndarray:
-    """
-    Convert a float/torch image tensor in [0,1] or arbitrary range
-    into a uint8 RGB array of shape [H, W, 3] suitable for saving or overlay.
-    """
     t = torch.from_numpy(x) if isinstance(x, np.ndarray) else x
     if t.ndim == 3 and t.shape[0] in (1, 3):
         t = t.permute(1, 2, 0)
     t = t.detach().cpu().float()
-
-    # if single-channel, repeat to RGB
     if t.ndim == 2:
         t = t.unsqueeze(-1).repeat(1, 1, 3)
-
     t_min, t_max = t.min(), t.max()
     if t_min < 0 or t_max > 1:
-        # normalize to [0,1]
         t = (t - t_min) / (t_max - t_min + 1e-8)
-
     return (t.clamp(0, 1).numpy() * 255.0).astype(np.uint8)
 
 
-def overlay_heat(
-    img_uint8: np.ndarray,
-    heatmap: TensorLike,
-    cmap: str = "viridis",
-    alpha: float = 0.5,
-) -> np.ndarray:
-    """
-    Alpha-blend a heatmap on top of an RGB uint8 image.
-    Returns a uint8 RGB overlay. Does not display or save.
-    """
+def overlay_heat(img_uint8: np.ndarray, heatmap: TensorLike, cmap: str = "viridis", alpha: float = 0.5) -> np.ndarray:
     from matplotlib import cm
-
     h = heatmap.detach().cpu().numpy() if torch.is_tensor(heatmap) else np.asarray(heatmap)
     h = (h - h.min()) / (h.max() - h.min() + 1e-8)
-
     heat_rgb = (cm.get_cmap(cmap)(h)[..., :3] * 255.0).astype(np.uint8)
-    out = (
-        img_uint8.astype(np.float32) * (1 - alpha)
-        + heat_rgb.astype(np.float32) * alpha
-    ).clip(0, 255)
-
+    out = (img_uint8.astype(np.float32) * (1 - alpha) + heat_rgb.astype(np.float32) * alpha).clip(0, 255)
     return out.astype(np.uint8)
 
 
+# ----------------------------
+# unwrap helper
+# ----------------------------
 def _unwrap_hf_vit(module: nn.Module) -> nn.Module:
     """
-    If vit_backbone(...) doesn't directly accept output_attentions=True,
-    walk down into submodules to find the part that does (for some HF models).
+    Try very hard to find the real HF ViT/DeiT inside user wrappers.
+    We accept:
+      1) a module whose config.model_type is deit/vit/beit/vision-transformer
+      2) a module whose forward(...) has output_attentions
+    If nothing is found we just return the original module.
     """
-    q, seen = deque([module])
+    q, seen = deque([module]), set()
     while q:
         m = q.popleft()
         if id(m) in seen:
             continue
         seen.add(id(m))
 
+        cfg = getattr(m, "config", None)
+        if cfg is not None:
+            mt = getattr(cfg, "model_type", None)
+            if mt in ("deit", "vit", "beit", "vision-transformer"):
+                return m
+
         try:
-            if "output_attentions" in inspect.signature(m.forward).parameters:
+            sig = inspect.signature(m.forward)
+            if "output_attentions" in sig.parameters:
                 return m
         except Exception:
             pass
 
-        # search typical attribute names used in DeiT / ViT wrappers
-        for name in ("model", "backbone", "deit", "encoder", "transformer"):
+        for name in ("model", "backbone", "vit", "deit", "encoder", "transformer"):
             if hasattr(m, name):
                 sub = getattr(m, name)
                 if isinstance(sub, nn.Module):
@@ -183,9 +153,12 @@ def _unwrap_hf_vit(module: nn.Module) -> nn.Module:
         for c in m.children():
             q.append(c)
 
-    raise TypeError("No DeiT-like submodule with output_attentions found")
+    return module  # fallback
 
 
+# ----------------------------
+# attention rollout
+# ----------------------------
 @torch.no_grad()
 def get_vit_attention(
     vit_backbone: nn.Module,
@@ -195,243 +168,141 @@ def get_vit_attention(
     device: Optional[torch.device] = None,
 ) -> torch.Tensor:
     """
-    Generate a spatial attention/relevance map from a ViT/DeiT-like model.
-
-    Steps (attention rollout style):
-    1. Forward the image through the ViT with output_attentions=True.
-    2. Average heads, keep strongest connections (optionally discard low weights).
-    3. Multiply attention matrices layer by layer to propagate CLS token relevance.
-    4. Drop CLS / distillation tokens, reshape the remaining tokens back to a grid.
-    5. Upsample to the original HxW.
-
-    Returns:
-        heatmap [H, W] normalized to [0,1] as a torch.Tensor on CPU.
+    Attention rollout that survives:
+    - hybrids and feature wrappers
+    - HF sdpa default
+    - DeiT with distillation token
     """
+    # 1) always unwrap first
+    vit_backbone = _unwrap_hf_vit(vit_backbone)
+
+    # 2) force HF to give us attentions
+    cfg = getattr(vit_backbone, "config", None)
+    if cfg is not None:
+        cfg.return_dict = True
+        # hit both, some HF versions check the private field
+        cfg._attn_implementation = "eager"
+        cfg.attn_implementation = "eager"
+        cfg.output_attentions = True
+
+    # 3) preprocess image
     H, W = _get_hw(img)
     x = _to_tensor_nchw(img)
-
-    # Optional preprocessing (e.g. normalization)
     if preprocess is not None:
         x = preprocess(x)
-
-    # Pick device if not given
     if device is None:
         device = next(vit_backbone.parameters()).device
     x = x.to(device)
-
     vit_backbone.eval()
 
-    # Try multiple call signatures depending on model wrapper
-    try:
-        out = vit_backbone(x, output_attentions=True, return_dict=True)
-    except TypeError:
-        try:
-            out = vit_backbone(pixel_values=x, output_attentions=True, return_dict=True)
-        except TypeError:
-            core = _unwrap_hf_vit(vit_backbone)
-            out = core(pixel_values=x, output_attentions=True, return_dict=True)
+    # 4) call HF DeiT/Vit in the canonical way
+    out = vit_backbone(pixel_values=x, output_attentions=True, return_dict=True)
+    atts = getattr(out, "attentions", None)
+    if not atts or atts[0].ndim != 4:
+        raise RuntimeError("No attentions")
 
-    atts = out.attentions
-    if (not atts) or (atts[0].ndim != 4):
-        raise RuntimeError("No attentions returned from ViT backbone")
-
-    # Combine attention across layers
-    T = atts[0].shape[-1]  # number of tokens
-    rollout = torch.eye(T, dtype=torch.float32, device=x.device)
-
+    # 5) rollout
+    T = atts[0].shape[-1]
+    result = torch.eye(T, dtype=torch.float32, device=x.device)
     for att in atts:
-        # att shape [B, heads, T, T]; take first sample and mean over heads
-        a = att[0].mean(dim=0)
-
-        # keep only top weights if discard_ratio > 0
+        a = att[0].mean(dim=0)  # [T, T]
         if discard_ratio and discard_ratio > 0:
             flat = a.reshape(-1)
             k = int(round(discard_ratio * flat.numel()))
             if 0 < k < flat.numel():
                 cutoff = torch.sort(flat, descending=True).values[k]
                 a = torch.where(a < cutoff, torch.zeros_like(a), a)
-
-        # add identity for residual
         a = a + torch.eye(T, device=x.device, dtype=a.dtype)
-        # row-normalize
         a = a / a.sum(dim=-1, keepdim=True)
+        result = a @ result
 
-        rollout = a @ rollout
-
-    # Some ViT variants prepend 1 or 2 special tokens (CLS, distill)
-    # We try to drop them and reshape the rest into a square grid.
+    # 6) drop class token (and distil token if present)
     drop = 2 if int(math.isqrt(T - 2)) ** 2 == (T - 2) else 1
-    vec = rollout[0, drop:]  # relevance from CLS to spatial tokens only
-
+    vec = result[0, drop:]
     M = vec.numel()
     n = int(math.isqrt(M))
     if n * n != M:
-        raise ValueError(f"Token grid is not square (got {M} tokens)")
-
+        raise ValueError(f"Token grid not square. Got {M}")
     grid = vec.reshape(1, 1, n, n)
-    grid = F.interpolate(
-        grid,
-        size=(H, W),
-        mode="bilinear",
-        align_corners=False,
-    )[0, 0]
-
-    # Normalize to [0,1] and return on CPU
+    grid = F.interpolate(grid, size=(H, W), mode="bilinear", align_corners=False)[0, 0]
     grid = (grid - grid.min()) / (grid.max() - grid.min() + 1e-8)
     return grid.detach().cpu()
 
 
-def layercam(
-    model: nn.Module,
-    x: torch.Tensor,
-    target_layer: nn.Module,
-    class_index: Optional[int] = None,
-) -> np.ndarray:
-    """
-    Compute a LayerCAM-style saliency map for a CNN-like model layer.
-
-    Arguments:
-        model: full model that produces logits in forward
-        x: input image tensor [1, C, H, W] or [C, H, W]
-        target_layer: convolutional layer to probe
-        class_index: which class index to backprop.
-                     If None, uses argmax (or 0 if binary head)
-
-    Returns:
-        cam: numpy array [H, W] in [0,1]
-    """
+# ----------------------------
+# LayerCAM
+# ----------------------------
+def layercam(model: nn.Module, x: torch.Tensor, target_layer: nn.Module, class_index: Optional[int] = None) -> np.ndarray:
     model.eval()
     device = next(model.parameters()).device
-
-    # ensure batch dimension
     if x.ndim == 3:
         x = x.unsqueeze(0)
     x = x.to(device)
-
     B, C, H, W = x.shape
-    assert B == 1, "layercam expects a single image (batch size 1)"
+    assert B == 1
+    acts, grads = [], []
 
-    acts: List[torch.Tensor] = []
-    grads: List[torch.Tensor] = []
-
-    def fwd_hook(_m, _i, o):
+    def fwd_hook(m, i, o):
         acts.append(o)
 
-    def bwd_hook(_m, _gi, go):
+    def bwd_hook(m, gi, go):
         grads.append(go[0])
 
     h1 = target_layer.register_forward_hook(fwd_hook)
     h2 = target_layer.register_full_backward_hook(bwd_hook)
-
     try:
         out = model(x)
         logits = _get_logits(out)
         if logits.ndim != 2:
-            raise ValueError(f"Unexpected logits shape {tuple(logits.shape)}")
-
-        # choose which score to explain
+            raise ValueError(f"Bad logits shape {tuple(logits.shape)}")
         if class_index is None:
             class_index = 0 if logits.shape[1] == 1 else int(torch.argmax(logits, dim=1).item())
-
         score = logits[:, class_index].sum()
-
-        # standard grad-based attribution
         model.zero_grad(set_to_none=True)
         score.backward()
-
-        A = acts[0].clamp(min=0)    # activations
-        G = grads[0].clamp(min=0)   # gradients
-
-        cam = (A * G).sum(dim=1, keepdim=True)  # [1,1,h,w]
+        A, G = acts[0], grads[0]
+        A = A.clamp(min=0)
+        G = G.clamp(min=0)
+        cam = (A * G).sum(dim=1, keepdim=True)
         cam = F.interpolate(cam, size=(H, W), mode="bilinear", align_corners=False)[0, 0]
-
         cam = cam - cam.min()
         cam = cam / (cam.max() + 1e-6)
-
         return cam.detach().cpu().numpy()
-
     finally:
         h1.remove()
         h2.remove()
 
 
-def pick_last_k_convs(
-    module: nn.Module,
-    k: int = 3,
-    include_1x1: bool = False,
-):
-    """
-    Collect the last k convolutional layers in a model or submodule.
-    Useful for building multi-layer CAM.
-    """
+def pick_last_k_convs(module: nn.Module, k: int = 3, include_1x1: bool = False):
     convs = []
     for _, m in module.named_modules():
         if isinstance(m, nn.Conv2d):
             if include_1x1:
                 convs.append(m)
             else:
-                if isinstance(m.kernel_size, tuple):
-                    ks = m.kernel_size
-                else:
-                    ks = (m.kernel_size, m.kernel_size)
+                ks = m.kernel_size if isinstance(m.kernel_size, tuple) else (m.kernel_size, m.kernel_size)
                 if ks != (1, 1):
                     convs.append(m)
-
     if not convs:
         raise ValueError("No Conv2d layers found")
-
-    # deepest k, but keep returned order shallow -> deep
-    return convs[-k:]
+    return convs[-k:]  # deepest k, kept in shallow-to-deep order
 
 
-def layercam_multi(
-    model: nn.Module,
-    x: torch.Tensor,
-    target_layers,
-    class_index: Optional[int] = None,
-    weights=None,
-    combine: str = "mean",
-    return_all: bool = False,
-):
-    """
-    Compute LayerCAM on multiple layers and fuse them.
-
-    Arguments:
-        model: full model
-        x: input image [1, C, H, W] or [C, H, W]
-        target_layers: list of Conv2d layers (e.g. output of pick_last_k_convs)
-        class_index: class to explain (None = argmax/0 default)
-        weights: optional list of per-layer weights
-        combine: "mean", "sum", or "max"
-        return_all: if True, also return per-layer maps
-
-    Returns:
-        fused_map: numpy array [H, W] in [0,1]
-        (optionally) list of individual maps
-    """
-    maps = [
-        torch.from_numpy(layercam(model, x, L, class_index=class_index))
-        for L in target_layers
-    ]
-    M = torch.stack(maps, dim=0)  # [L, H, W]
-
-    # optional weighting
+def layercam_multi(model, x, target_layers, class_index=None, weights=None, combine="mean", return_all=False):
+    maps = [torch.from_numpy(layercam(model, x, L, class_index=class_index)) for L in target_layers]
+    M = torch.stack(maps, dim=0)
     if weights is not None:
         w = torch.tensor(weights, dtype=M.dtype)
         w = w / max(w.sum().item(), 1e-6)
         M = M * w.view(-1, 1, 1)
-
-    # fuse
     if combine == "max":
         fused = M.max(dim=0).values
     elif combine == "sum":
         fused = M.sum(dim=0)
     else:
         fused = M.mean(dim=0)
-
     fused = fused - fused.min()
     fused = fused / max(fused.max().item(), 1e-6)
-
     if return_all:
         per_layer = []
         for t in maps:
@@ -439,5 +310,4 @@ def layercam_multi(
             tt = tt / max(tt.max().item(), 1e-6)
             per_layer.append(tt.numpy())
         return fused.numpy(), per_layer
-
     return fused.numpy()
