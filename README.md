@@ -160,23 +160,31 @@ Trainer(model, args, train_dataset, eval_dataset, optimizers=(optimizer, schedul
 
 All experiments were run in **Google Colab Pro+** with:
 
-* **GPU:** NVIDIA A100 (40 GB VRAM)
-* **RAM:** 83.5 GB
-* **Disk:** 235.7 GB
+- **GPU:** NVIDIA A100 (40 GB VRAM)
+- **RAM:** 83.5 GB
+- **Disk:** 235.7 GB
 
 Key dependencies:
 
-| Library      | Version | Purpose            |
-| ------------ | ------- | ------------------ |
-| PyTorch      | 2.8.0   | Core framework     |
-| CUDA         | 12.6    | GPU backend        |
-| timm         | 1.0.20  | CNN backbones      |
-| Transformers | 4.57.1  | ViT/DeiT           |
-| scikit-learn | 1.6.1   | Evaluation metrics |
-| NumPy        | 2.0.2   | Array ops          |
-| Matplotlib   | 3.10.0  | Visualization      |
+| Library        | Version   | Purpose                       |
+| -------------- | --------- | ----------------------------- |
+| Python         | 3.12.12   | Runtime                       |
+| PyTorch        | 2.8.0+cu126 | Core framework               |
+| CUDA (PyTorch) | 12.6      | GPU backend                   |
+| torchvision    | 0.23.0+cu126 | Vision utilities            |
+| timm           | 1.0.21    | CNN and ViT backbones         |
+| Transformers   | 4.57.1    | DeiT and ViT models           |
+| NumPy          | 2.0.2     | Array operations              |
+| pandas         | 2.2.2     | Data handling                 |
+| scikit-learn   | 1.6.1     | Evaluation metrics            |
+| SciPy          | 1.16.3    | Statistical tests (Wilcoxon)  |
+| statsmodels    | 0.14.5    | McNemar exact test            |
+| Matplotlib     | 3.10.0    | Visualisation                 |
+| Pillow         | 11.3.0    | Image I/O for transforms      |
+| OpenCV (cv2)   | 4.12.0    | Preprocessing and CLAHE       |
 
-Mixed-precision (FP16) training and inference were enabled where available.
+Mixed precision (FP16) training and inference were enabled where available.
+
 
 ---
 
@@ -216,4 +224,5 @@ Mixed-precision (FP16) training and inference were enabled where available.
 [https://doi.org/10.1109/CVPR.2018.00745](https://doi.org/10.1109/CVPR.2018.00745)
 
 ---
+
 
