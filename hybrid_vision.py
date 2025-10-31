@@ -282,47 +282,50 @@ class CNNExtractor(nn.Module):
 
 
 class ViTFeatureLayer(nn.Module):
-    """
-    Wraps a DeiT/ViT model and returns the CLS token embedding [B, D],
-    with optional dropout for regularization.
-    """
-    def __init__(self, vit_model: nn.Module, dropout_p: float = 0.1):
+    def __init__(self, vit_model, dropout_p=0.1):
         super().__init__()
-        # Some wrappers store the transformer in .vit already
+        # vit_model can be a plain HF DeiT/ViT or a wrapper with .vit
         self.vit = getattr(vit_model, "vit", vit_model)
         self.drop = nn.Dropout(dropout_p)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # HuggingFace ViT / DeiT interface
+    def forward(self, x, **kwargs):
+        # Hugging Face style models
         if hasattr(self.vit, "config"):
-            out = self.vit(x, return_dict=True)
-            cls_token = out.last_hidden_state[:, 0]        # [B, D]
-            return self.drop(cls_token)
+            # make sure we always get dict outputs
+            self.vit.config.return_dict = True
+            # if caller asked for attentions, enable it
+            if kwargs.get("output_attentions", False):
+                self.vit.config.output_attentions = True
 
-        # timm ViT interface
+            # HF DeiT usually wants pixel_values=
+            try:
+                out = self.vit(pixel_values=x, **kwargs)
+            except TypeError:
+                # fallback for models that still accept x
+                out = self.vit(x, **kwargs)
+
+            cls = out.last_hidden_state[:, 0]
+            return self.drop(cls)
+
+        # timm style models
         if hasattr(self.vit, "forward_features"):
-            feats = self.vit.forward_features(x)
-
-            # timm sometimes returns dicts
+            feats = self.vit.forward_features(x, **kwargs)
             if isinstance(feats, dict):
-                token = feats.get("x", None)
-                if token is None:
-                    # fallback: first 2D tensor in dict
+                t = feats.get("x", None)
+                if t is None:
+                    # pick any 2D tensor
                     for v in feats.values():
                         if isinstance(v, torch.Tensor) and v.ndim == 2:
-                            token = v
+                            t = v
                             break
-                cls_token = token
-            else:
-                # tensor
-                if feats.ndim == 3:
-                    cls_token = feats[:, 0]                # [B, D]
-                else:
-                    cls_token = feats                      # already [B, D]
+                return self.drop(t)
+            if feats.ndim == 3:
+                return self.drop(feats[:, 0])
+            return self.drop(feats)
 
-            return self.drop(cls_token)
+        raise ValueError("Unsupported ViT model for feature extraction")
 
-        raise ValueError("Unsupported ViT model type for feature extraction")
+
 
 
 # -------------------------------------------------
